@@ -60,7 +60,7 @@ Grounded in Nicotine+ (`pynicotine/slskmessages.py`) and `SLSKPROTOCOL.md`.
 | `40` | `TransferRequest` | Send & Recv | Full | Handles incoming `direction = 1` upload offers from peer; politely rejects `direction = 0` download requests (`"File not shared."`). |
 | `41` | `TransferResponse` | Send & Recv | Full | Accepts matched transfer tickets (`allowed = true`) or rejects unknown/cancelled ones. |
 | `43` | `QueueUpload` | Send & Recv | Full | Enqueues file download on remote peer. |
-| `44` | `PlaceInQueueResponse` | Send & Recv | Full | Updates live queue placement and fires JS progress callback (`phase: "queued"`). |
+| `44` | `PlaceInQueueResponse` | Send & Recv | Full | Updates live queue placement and invokes the progress callback (`TransferPhase::Queued`). |
 | `46` | `UploadFailed` | Send & Recv | Full | Fails waiting download cleanly when peer cannot read/upload file. |
 | `50` | `UploadDenied` | Send & Recv | Full | Fails download immediately with peer's rejection reason (`File not shared.`, `Banned`, `Too many files`, etc.). |
 | `51` | `PlaceInQueueRequest` | Send & Recv | Full | Sent after `QueueUpload` and polled every 30s while queued. |

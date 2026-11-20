@@ -1,7 +1,7 @@
-//! Standalone Soulseek client library for PearTube, with C FFI for Bare native addons.
+//! Standalone Soulseek client library in Rust with a non-blocking C ABI (`soulseek/soulseek.h`).
 
-pub mod addon;
 pub mod client;
+pub mod ffi;
 pub mod proto;
 pub mod transfer;
 

@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-description = "Standalone Soulseek client library with C FFI for the PearTube Bare addon"
+description = "Standalone Soulseek client library in Rust with C ABI"
+links = "peartube_soulseek"
 
 [lib]
 name = "peartube_soulseek"

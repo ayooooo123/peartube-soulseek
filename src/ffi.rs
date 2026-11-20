@@ -1,7 +1,7 @@
-//! `extern "C"` FFI surface consumed by `soulseek/addon.c` (`BARE_MODULE`).
+//! `extern "C"` FFI surface declared in `soulseek/soulseek.h`.
 //!
 //! Every async entrypoint spawns off-thread work and invokes its completion callback
-//! asynchronously so the Bare event loop thread is never blocked.
+//! asynchronously so host event loops are never blocked.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
