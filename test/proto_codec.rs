@@ -12,11 +12,12 @@ use peartube_soulseek::proto::{
 };
 
 fn unhex(hex: &str) -> Vec<u8> {
-    let clean: Vec<u8> = hex
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    assert_eq!(clean.len() % 2, 0, "hex fixture must have even nibble count");
+    let clean: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    assert_eq!(
+        clean.len() % 2,
+        0,
+        "hex fixture must have even nibble count"
+    );
     clean
         .chunks_exact(2)
         .map(|pair| {
@@ -385,7 +386,10 @@ fn peer_init_messages_round_trip_hex() {
     let pf = PeerInitMessage::PierceFirewall { token: 0x00ab_cdef };
     let pf_bytes = pf.encode();
     assert_eq!(to_hex(&pf_bytes), "0500000000efcdab00");
-    assert_eq!(PeerInitMessage::decode(strip_len_prefix(&pf_bytes)).unwrap(), pf);
+    assert_eq!(
+        PeerInitMessage::decode(strip_len_prefix(&pf_bytes)).unwrap(),
+        pf
+    );
 
     // PeerInit(username="ab", conn_type="P", token=0) -> len=16 (0x10), code=0x01(u8)
     let pi = PeerInitMessage::PeerInit {
@@ -398,7 +402,10 @@ fn peer_init_messages_round_trip_hex() {
         to_hex(&pi_bytes),
         "1000000001020000006162010000005000000000"
     );
-    assert_eq!(PeerInitMessage::decode(strip_len_prefix(&pi_bytes)).unwrap(), pi);
+    assert_eq!(
+        PeerInitMessage::decode(strip_len_prefix(&pi_bytes)).unwrap(),
+        pi
+    );
 }
 
 #[test]

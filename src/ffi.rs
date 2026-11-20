@@ -148,6 +148,9 @@ pub extern "C" fn slsk_client_new(listen_port: u16) -> *mut SlskClientHandle {
     }))
 }
 
+/// # Safety
+/// `client` must be either null or a valid pointer previously returned by `slsk_client_new`
+/// that has not yet been freed and is no longer concurrently accessed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_free(client: *mut SlskClientHandle) {
     if !client.is_null() {
@@ -157,6 +160,8 @@ pub unsafe extern "C" fn slsk_client_free(client: *mut SlskClientHandle) {
     }
 }
 
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_state(client: *const SlskClientHandle) -> SlskState {
     if client.is_null() {
@@ -172,6 +177,9 @@ pub unsafe extern "C" fn slsk_client_state(client: *const SlskClientHandle) -> S
     SlskState::from(handle.inner.state())
 }
 
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
+/// If `cb` is provided, `ctx` must remain valid whenever `cb` is invoked on worker threads.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_set_logger(
     client: *mut SlskClientHandle,
@@ -203,6 +211,10 @@ pub unsafe extern "C" fn slsk_client_set_logger(
     }
 }
 
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
+/// `server`, `username`, and `password` must each be either null or valid NUL-terminated C strings
+/// for the duration of this call, and `req_ctx` must be safe to pass back to `done`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_login_async(
     client: *const SlskClientHandle,
@@ -236,23 +248,29 @@ pub unsafe extern "C" fn slsk_client_login_async(
 
     let _ = thread::Builder::new()
         .name("slsk-ffi-login".to_string())
-        .spawn(move || match inner.login(&server, port, &username, &password) {
-            Ok(st) => done(
-                raw_ctx.0 as *mut std::ffi::c_void,
-                ptr::null(),
-                SlskState::from(st),
-            ),
-            Err(e) => {
-                let c_err = to_cstring_lossy(&e.to_string());
-                done(
+        .spawn(
+            move || match inner.login(&server, port, &username, &password) {
+                Ok(st) => done(
                     raw_ctx.0 as *mut std::ffi::c_void,
-                    c_err.as_ptr(),
-                    SlskState::from(inner.state()),
-                );
-            }
-        });
+                    ptr::null(),
+                    SlskState::from(st),
+                ),
+                Err(e) => {
+                    let c_err = to_cstring_lossy(&e.to_string());
+                    done(
+                        raw_ctx.0 as *mut std::ffi::c_void,
+                        c_err.as_ptr(),
+                        SlskState::from(inner.state()),
+                    );
+                }
+            },
+        );
 }
 
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
+/// `query` must be either null or a valid NUL-terminated C string for the duration of this call,
+/// and `req_ctx` must be safe to pass back to `done`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_search_async(
     client: *const SlskClientHandle,
@@ -264,7 +282,11 @@ pub unsafe extern "C" fn slsk_client_search_async(
     let raw_ctx = SendPtr(req_ctx as usize);
     if client.is_null() {
         let err = to_cstring_lossy("null client handle");
-        done(raw_ctx.0 as *mut std::ffi::c_void, err.as_ptr(), ptr::null_mut());
+        done(
+            raw_ctx.0 as *mut std::ffi::c_void,
+            err.as_ptr(),
+            ptr::null_mut(),
+        );
         return;
     }
     let inner = unsafe { Arc::clone(&(*client).inner) };
@@ -288,6 +310,10 @@ pub unsafe extern "C" fn slsk_client_search_async(
         });
 }
 
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
+/// `username` must be either null or a valid NUL-terminated C string for the duration of this call,
+/// and `req_ctx` must be safe to pass back to `done`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_browse_async(
     client: *const SlskClientHandle,
@@ -299,7 +325,11 @@ pub unsafe extern "C" fn slsk_client_browse_async(
     let raw_ctx = SendPtr(req_ctx as usize);
     if client.is_null() {
         let err = to_cstring_lossy("null client handle");
-        done(raw_ctx.0 as *mut std::ffi::c_void, err.as_ptr(), ptr::null_mut());
+        done(
+            raw_ctx.0 as *mut std::ffi::c_void,
+            err.as_ptr(),
+            ptr::null_mut(),
+        );
         return;
     }
     let inner = unsafe { Arc::clone(&(*client).inner) };
@@ -312,22 +342,28 @@ pub unsafe extern "C" fn slsk_client_browse_async(
 
     let _ = thread::Builder::new()
         .name("slsk-ffi-browse".to_string())
-        .spawn(move || match inner.browse_with_timeout(&username, timeout) {
-            Ok(records) => {
-                let list = box_file_list(records);
-                done(raw_ctx.0 as *mut std::ffi::c_void, ptr::null(), list);
-            }
-            Err(e) => {
-                let c_err = to_cstring_lossy(&e.to_string());
-                done(
-                    raw_ctx.0 as *mut std::ffi::c_void,
-                    c_err.as_ptr(),
-                    ptr::null_mut(),
-                );
-            }
-        });
+        .spawn(
+            move || match inner.browse_with_timeout(&username, timeout) {
+                Ok(records) => {
+                    let list = box_file_list(records);
+                    done(raw_ctx.0 as *mut std::ffi::c_void, ptr::null(), list);
+                }
+                Err(e) => {
+                    let c_err = to_cstring_lossy(&e.to_string());
+                    done(
+                        raw_ctx.0 as *mut std::ffi::c_void,
+                        c_err.as_ptr(),
+                        ptr::null_mut(),
+                    );
+                }
+            },
+        );
 }
 
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
+/// `username`, `filename`, and `dest_path` must each be either null or valid NUL-terminated C strings
+/// for the duration of this call, and `req_ctx` must be safe to pass back to `on_progress` and `done`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_client_download_async(
     client: *const SlskClientHandle,
@@ -341,7 +377,11 @@ pub unsafe extern "C" fn slsk_client_download_async(
     let raw_ctx = SendPtr(req_ctx as usize);
     if client.is_null() {
         let err = to_cstring_lossy("null client handle");
-        done(raw_ctx.0 as *mut std::ffi::c_void, err.as_ptr(), ptr::null_mut());
+        done(
+            raw_ctx.0 as *mut std::ffi::c_void,
+            err.as_ptr(),
+            ptr::null_mut(),
+        );
         return;
     }
     let inner = unsafe { Arc::clone(&(*client).inner) };
@@ -376,8 +416,8 @@ pub unsafe extern "C" fn slsk_client_download_async(
 
     let _ = thread::Builder::new()
         .name("slsk-ffi-download".to_string())
-        .spawn(move || {
-            match inner.download(&username, &filename, dest_path, progress_hook) {
+        .spawn(
+            move || match inner.download(&username, &filename, dest_path, progress_hook) {
                 Ok(DownloadOutcome {
                     path,
                     size,
@@ -399,10 +439,13 @@ pub unsafe extern "C" fn slsk_client_download_async(
                         ptr::null_mut(),
                     );
                 }
-            }
-        });
+            },
+        );
 }
 
+/// # Safety
+/// `list` must be either null or a pointer previously delivered to a `SlskFilesDoneCb`
+/// that has not yet been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_file_list_free(list: *mut SlskFileList) {
     if list.is_null() {
@@ -423,6 +466,9 @@ pub unsafe extern "C" fn slsk_file_list_free(list: *mut SlskFileList) {
     }
 }
 
+/// # Safety
+/// `res` must be either null or a pointer previously delivered to a `SlskDownloadDoneCb`
+/// that has not yet been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn slsk_download_result_free(res: *mut SlskDownloadResult) {
     if res.is_null() {

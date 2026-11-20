@@ -142,10 +142,7 @@ fn end_to_end_login_search_browse_and_resumed_download_over_loopback() {
             .unwrap();
         let mut client_listen_port: u16 = 0;
 
-        loop {
-            let Ok(frame) = read_frame_sync(&mut sock) else {
-                break;
-            };
+        while let Ok(frame) = read_frame_sync(&mut sock) {
             let mut r = WireReader::new(&frame);
             let code = r.read_u32().unwrap();
             match code {
@@ -250,10 +247,7 @@ fn end_to_end_login_search_browse_and_resumed_download_over_loopback() {
 
         let remote_file = "@@vault\\PrivateDir\\SecretArtist\\01 - LosslessTrack.flac";
 
-        loop {
-            let Ok(frame) = read_frame_sync(&mut p_sock) else {
-                break;
-            };
+        while let Ok(frame) = read_frame_sync(&mut p_sock) {
             let msg = PeerMessage::decode(&frame).unwrap();
             match msg {
                 PeerMessage::UserInfoRequest => {
@@ -416,7 +410,10 @@ fn end_to_end_login_search_browse_and_resumed_download_over_loopback() {
     assert_eq!(outcome.path, dest_file);
     assert_eq!(outcome.size, file_payload.len() as u64);
     assert_eq!(outcome.resumed_from, 65_536);
-    assert!(!part_file.exists(), ".part file must be renamed on completion");
+    assert!(
+        !part_file.exists(),
+        ".part file must be renamed on completion"
+    );
 
     let disk_bytes = fs::read(&dest_file).unwrap();
     assert_eq!(disk_bytes, file_payload);

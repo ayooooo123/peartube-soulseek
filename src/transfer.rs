@@ -72,7 +72,10 @@ impl fmt::Display for TransferError {
             Self::Denied(reason) => write!(f, "upload denied by peer: {reason}"),
             Self::UploadFailed => write!(f, "peer reported upload failed"),
             Self::Incomplete { received, expected } => {
-                write!(f, "incomplete transfer: received {received} of {expected} bytes")
+                write!(
+                    f,
+                    "incomplete transfer: received {received} of {expected} bytes"
+                )
             }
             Self::InvalidDestination(msg) => write!(f, "invalid destination path: {msg}"),
         }
@@ -91,7 +94,10 @@ pub struct DownloadOutcome {
 /// Resolve destination path: if `dest_path` is an existing directory (or ends with a path
 /// separator), append the sanitized leaf basename of `remote_filename`. Otherwise treat
 /// `dest_path` as the exact target file path.
-pub fn resolve_dest_file(dest_path: &Path, remote_filename: &str) -> Result<PathBuf, TransferError> {
+pub fn resolve_dest_file(
+    dest_path: &Path,
+    remote_filename: &str,
+) -> Result<PathBuf, TransferError> {
     let raw_str = dest_path.as_os_str().to_string_lossy();
     let looks_like_dir = dest_path.is_dir() || raw_str.ends_with('/') || raw_str.ends_with('\\');
     let target = if looks_like_dir {
@@ -242,8 +248,8 @@ pub fn dial_pierced_file_socket(
             ))
         })?;
 
-    let mut stream = TcpStream::connect_timeout(&addr, DIAL_TIMEOUT)
-        .map_err(TransferError::DialFailed)?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, DIAL_TIMEOUT).map_err(TransferError::DialFailed)?;
     let _ = stream.set_nodelay(true);
     stream
         .set_read_timeout(Some(DIAL_TIMEOUT))

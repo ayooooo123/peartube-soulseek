@@ -10,13 +10,12 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Mutex, RwLock};
 use crate::proto::{
     ConnectionType, DEFAULT_MAJOR_VERSION, DEFAULT_MINOR_VERSION, FrameDecoder, PeerInitMessage,
     PeerMessage, ProtoError, ServerRequest, ServerResponse, SharedFileRecord,
@@ -26,6 +25,7 @@ use crate::transfer::{
     DownloadOutcome, ProgressCallback, TransferError, TransferPhase, TransferProgress,
     dial_pierced_file_socket, redacted_basename, resolve_dest_file, stream_file_download,
 };
+use parking_lot::{Mutex, RwLock};
 
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(45);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
@@ -827,7 +827,10 @@ impl WorkerEngine {
         }
     }
 
-    fn connect_and_authenticate(&mut self, creds: &Credentials) -> Result<ClientState, ClientError> {
+    fn connect_and_authenticate(
+        &mut self,
+        creds: &Credentials,
+    ) -> Result<ClientState, ClientError> {
         self.disconnect_server();
 
         let addr: SocketAddr = format!("{}:{}", creds.server_host, creds.server_port)
@@ -1126,7 +1129,11 @@ impl WorkerEngine {
                     token: 0,
                 }
                 .encode();
-                if stream.write_all(&init).and_then(|()| stream.flush()).is_err() {
+                if stream
+                    .write_all(&init)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
                     return;
                 }
                 Self::spawn_peer_reader(username, stream, FrameDecoder::new(), tx, log);
@@ -1135,7 +1142,7 @@ impl WorkerEngine {
 
     fn dial_peer_pierce_p(&self, username: String, ip: Ipv4Addr, port: u32, token: u32) {
         if ip.is_unspecified() || port == 0 || port > 65535 {
-            let _ = tx_cant_connect(&self.event_tx, username, token, "invalid peer address");
+            tx_cant_connect(&self.event_tx, username, token, "invalid peer address");
             return;
         }
         let tx = self.event_tx.clone();
@@ -1148,14 +1155,14 @@ impl WorkerEngine {
                 let mut stream = match TcpStream::connect_timeout(&addr, PEER_DIAL_TIMEOUT) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = tx_cant_connect(&tx, username, token, &e.to_string());
+                        tx_cant_connect(&tx, username, token, &e.to_string());
                         return;
                     }
                 };
                 let _ = stream.set_nodelay(true);
                 let pierce = PeerInitMessage::PierceFirewall { token }.encode();
                 if let Err(e) = stream.write_all(&pierce).and_then(|()| stream.flush()) {
-                    let _ = tx_cant_connect(&tx, username, token, &e.to_string());
+                    tx_cant_connect(&tx, username, token, &e.to_string());
                     return;
                 }
                 Self::spawn_peer_reader(username, stream, FrameDecoder::new(), tx, log);
@@ -1164,7 +1171,7 @@ impl WorkerEngine {
 
     fn dial_peer_pierce_f(&self, username: String, ip: Ipv4Addr, port: u32, token: u32) {
         if ip.is_unspecified() || port == 0 || port > 65535 {
-            let _ = tx_cant_connect(&self.event_tx, username, token, "invalid F peer address");
+            tx_cant_connect(&self.event_tx, username, token, "invalid F peer address");
             return;
         }
         let tx = self.event_tx.clone();
@@ -1181,7 +1188,7 @@ impl WorkerEngine {
                     });
                 }
                 Err(e) => {
-                    let _ = tx_cant_connect(&tx, username, token, &e.to_string());
+                    tx_cant_connect(&tx, username, token, &e.to_string());
                 }
             });
     }
@@ -1326,14 +1333,11 @@ impl WorkerEngine {
                 timeout,
                 reply,
             } => {
-                if let Err(e) =
-                    self.ensure_peer_control(&username, PeerMessage::UserInfoRequest)
-                        .and_then(|()| {
-                            self.ensure_peer_control(
-                                &username,
-                                PeerMessage::SharedFileListRequest,
-                            )
-                        })
+                if let Err(e) = self
+                    .ensure_peer_control(&username, PeerMessage::UserInfoRequest)
+                    .and_then(|()| {
+                        self.ensure_peer_control(&username, PeerMessage::SharedFileListRequest)
+                    })
                 {
                     let _ = reply.send(Err(e));
                     return;
@@ -1396,11 +1400,7 @@ impl WorkerEngine {
                 self.log(
                     LogLevel::Info,
                     "download_queued",
-                    format!(
-                        "queued {} from {}",
-                        redacted_basename(&filename),
-                        username
-                    ),
+                    format!("queued {} from {}", redacted_basename(&filename), username),
                 );
 
                 if let Some(cb) = &progress {
@@ -1779,7 +1779,8 @@ impl WorkerEngine {
         let now = Instant::now();
 
         // 1. Server keepalive ping
-        if self.server_stream.is_some() && now.duration_since(self.last_ping) >= SERVER_PING_INTERVAL
+        if self.server_stream.is_some()
+            && now.duration_since(self.last_ping) >= SERVER_PING_INTERVAL
         {
             self.last_ping = now;
             let _ = self.send_server(&ServerRequest::ServerPing);
@@ -1871,8 +1872,7 @@ impl WorkerEngine {
             i += 1;
         }
         for (u, f) in to_poll {
-            let _ =
-                self.ensure_peer_control(&u, PeerMessage::PlaceInQueueRequest { filename: f });
+            let _ = self.ensure_peer_control(&u, PeerMessage::PlaceInQueueRequest { filename: f });
         }
     }
 }
@@ -1881,18 +1881,14 @@ fn paths_match(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    a.replace('/', "\\").eq_ignore_ascii_case(&b.replace('/', "\\"))
+    a.replace('/', "\\")
+        .eq_ignore_ascii_case(&b.replace('/', "\\"))
 }
 
-fn tx_cant_connect(
-    tx: &Sender<WorkerEvent>,
-    username: String,
-    token: u32,
-    reason: &str,
-) -> Result<(), mpsc::SendError<WorkerEvent>> {
-    tx.send(WorkerEvent::PeerDialFailed {
+fn tx_cant_connect(tx: &Sender<WorkerEvent>, username: String, token: u32, reason: &str) {
+    let _ = tx.send(WorkerEvent::PeerDialFailed {
         username,
         connect_token: Some(token),
         reason: reason.to_owned(),
-    })
+    });
 }

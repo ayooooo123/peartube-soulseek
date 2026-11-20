@@ -246,7 +246,8 @@ impl WireWriter {
     /// Soulseek packs IPv4 addresses in reversed network order (`a.b.c.d` -> `[d, c, b, a]`).
     pub fn write_ipv4(&mut self, ip: Ipv4Addr) {
         let octets = ip.octets();
-        self.buf.extend_from_slice(&[octets[3], octets[2], octets[1], octets[0]]);
+        self.buf
+            .extend_from_slice(&[octets[3], octets[2], octets[1], octets[0]]);
     }
 
     #[must_use]
@@ -953,11 +954,7 @@ impl ServerResponse {
                     } else {
                         String::new()
                     };
-                    let is_supporter = if !r.is_empty() {
-                        r.read_bool()?
-                    } else {
-                        false
-                    };
+                    let is_supporter = if !r.is_empty() { r.read_bool()? } else { false };
                     Ok(Self::LoginSuccess {
                         motd,
                         own_ip,
@@ -983,16 +980,8 @@ impl ServerResponse {
                 let username = r.read_string()?;
                 let ip = r.read_ipv4()?;
                 let port = r.read_u32()?;
-                let obfuscation_type = if r.remaining() >= 4 {
-                    r.read_u32()?
-                } else {
-                    0
-                };
-                let obfuscated_port = if r.remaining() >= 2 {
-                    r.read_u16()?
-                } else {
-                    0
-                };
+                let obfuscation_type = if r.remaining() >= 4 { r.read_u32()? } else { 0 };
+                let obfuscated_port = if r.remaining() >= 2 { r.read_u16()? } else { 0 };
                 Ok(Self::PeerAddress {
                     username,
                     ip,
@@ -1046,11 +1035,7 @@ impl ServerResponse {
                 let port = r.read_u32()?;
                 let token = r.read_u32()?;
                 let privileged = if !r.is_empty() { r.read_bool()? } else { false };
-                let obfuscation_type = if r.remaining() >= 4 {
-                    r.read_u32()?
-                } else {
-                    0
-                };
+                let obfuscation_type = if r.remaining() >= 4 { r.read_u32()? } else { 0 };
                 let obfuscated_port = if r.remaining() >= 4 {
                     r.read_u32()?
                 } else if r.remaining() >= 2 {
@@ -1219,11 +1204,7 @@ impl PeerInitMessage {
                 let username = r.read_string()?;
                 let conn_str = r.read_string()?;
                 let conn_type = ConnectionType::parse(&conn_str)?;
-                let token = if r.remaining() >= 4 {
-                    r.read_u32()?
-                } else {
-                    0
-                };
+                let token = if r.remaining() >= 4 { r.read_u32()? } else { 0 };
                 Ok(Self::PeerInit {
                     username,
                     conn_type,
@@ -1339,7 +1320,9 @@ impl PeerMessage {
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
         let mut w = WireWriter::new();
         match self {
-            Self::SharedFileListRequest => Ok(w.into_u32_frame(peer_code::SHARED_FILE_LIST_REQUEST)),
+            Self::SharedFileListRequest => {
+                Ok(w.into_u32_frame(peer_code::SHARED_FILE_LIST_REQUEST))
+            }
             Self::SharedFileListResponse {
                 folders,
                 private_folders,
@@ -1697,9 +1680,7 @@ pub fn flatten_shared_folders(
     for dir in folders {
         let prefix = dir.path.trim_end_matches('\\');
         for f in &dir.files {
-            let full_path = if prefix.is_empty() {
-                f.filename.clone()
-            } else if f.filename.contains('\\') {
+            let full_path = if prefix.is_empty() || f.filename.contains('\\') {
                 f.filename.clone()
             } else {
                 format!("{prefix}\\{}", f.filename)
