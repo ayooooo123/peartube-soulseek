@@ -730,6 +730,9 @@ pub enum ServerRequest {
     AcceptChildren {
         accept: bool,
     },
+    SendUploadSpeed {
+        speed: u32,
+    },
     BranchLevel {
         level: u32,
     },
@@ -822,6 +825,10 @@ impl ServerRequest {
             Self::AcceptChildren { accept } => {
                 w.write_bool(*accept);
                 w.into_u32_frame(server_code::ACCEPT_CHILDREN)
+            }
+            Self::SendUploadSpeed { speed } => {
+                w.write_u32(*speed);
+                w.into_u32_frame(server_code::SEND_UPLOAD_SPEED)
             }
             Self::BranchLevel { level } => {
                 w.write_u32(*level);

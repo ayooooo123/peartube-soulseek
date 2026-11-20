@@ -4,14 +4,17 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::proto::{PeerInitMessage, encode_file_offset};
+use crate::proto::{
+    ConnectionType, PeerInitMessage, decode_file_offset, encode_file_offset,
+    encode_file_transfer_init,
+};
 
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const PROGRESS_REPORT_BYTES: usize = 128 * 1024;
@@ -89,6 +92,15 @@ pub struct DownloadOutcome {
     pub path: PathBuf,
     pub size: u64,
     pub resumed_from: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UploadOutcome {
+    pub path: PathBuf,
+    pub size: u64,
+    pub start_offset: u64,
+    pub bytes_sent: u64,
+    pub speed_bytes_per_sec: u32,
 }
 
 /// Resolve destination path: if `dest_path` is an existing directory (or ends with a path
@@ -386,4 +398,244 @@ pub fn stream_file_download(
         });
     }
     Ok(outcome)
+}
+
+/// Dial a peer directly on their advertised `GetPeerAddress` port for an outbound `F` upload,
+/// writing `PeerInit(own_username, "F", 0)` + 4-byte `FileTransferInit(transfer_token)`.
+pub fn dial_direct_upload_socket(
+    host: &str,
+    port: u32,
+    own_username: &str,
+    transfer_token: u32,
+) -> Result<TcpStream, TransferError> {
+    let addr: SocketAddr = format!("{host}:{port}")
+        .to_socket_addrs()
+        .map_err(TransferError::DialFailed)?
+        .next()
+        .ok_or_else(|| {
+            TransferError::DialFailed(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unresolvable peer address",
+            ))
+        })?;
+
+    let mut stream =
+        TcpStream::connect_timeout(&addr, DIAL_TIMEOUT).map_err(TransferError::DialFailed)?;
+    let _ = stream.set_nodelay(true);
+    stream
+        .set_read_timeout(Some(DIAL_TIMEOUT))
+        .map_err(TransferError::HandshakeFailed)?;
+    stream
+        .set_write_timeout(Some(DIAL_TIMEOUT))
+        .map_err(TransferError::HandshakeFailed)?;
+
+    let init = PeerInitMessage::PeerInit {
+        username: own_username.to_owned(),
+        conn_type: ConnectionType::File,
+        token: 0,
+    }
+    .encode();
+    stream
+        .write_all(&init)
+        .map_err(TransferError::HandshakeFailed)?;
+    stream
+        .write_all(&encode_file_transfer_init(transfer_token))
+        .map_err(TransferError::HandshakeFailed)?;
+    stream.flush().map_err(TransferError::HandshakeFailed)?;
+    Ok(stream)
+}
+
+/// Prepare an inbound pierced `F` socket (where the downloader connected to our listener with
+/// `PierceFirewall(connect_token)`) for uploading by writing the 4-byte `FileTransferInit` ticket.
+pub fn init_pierced_upload_socket(
+    mut stream: TcpStream,
+    transfer_token: u32,
+) -> Result<TcpStream, TransferError> {
+    let _ = stream.set_nodelay(true);
+    stream
+        .set_read_timeout(Some(DIAL_TIMEOUT))
+        .map_err(TransferError::HandshakeFailed)?;
+    stream
+        .set_write_timeout(Some(DIAL_TIMEOUT))
+        .map_err(TransferError::HandshakeFailed)?;
+    stream
+        .write_all(&encode_file_transfer_init(transfer_token))
+        .map_err(TransferError::HandshakeFailed)?;
+    stream.flush().map_err(TransferError::HandshakeFailed)?;
+    Ok(stream)
+}
+
+/// Stream a matched local file upload over an established `F` socket, mirroring
+/// `stream_file_download`'s phases (`Transferring` -> `Completed`), offsets, and stall timeouts.
+///
+/// Protocol order:
+/// 1. Read 8-byte little-endian `FileOffset` from downloader (`initial_buffered` + socket).
+/// 2. Seek local file to `offset` (clamped/validated `<= total_size`).
+/// 3. Stream raw file bytes `[offset..total_size]` in 64 KiB chunks.
+/// 4. Wait briefly for downloader-initiated EOF (`SLSKPROTOCOL` rule: downloader closes `F` socket).
+pub fn stream_file_upload(
+    mut stream: TcpStream,
+    initial_buffered: &[u8],
+    local_path: PathBuf,
+    cancel: &AtomicBool,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<UploadOutcome, TransferError> {
+    let mut file = File::open(&local_path).map_err(TransferError::ReadFailed)?;
+    let total_size = file.metadata().map_err(TransferError::ReadFailed)?.len();
+
+    stream
+        .set_read_timeout(Some(DIAL_TIMEOUT))
+        .map_err(TransferError::HandshakeFailed)?;
+    let mut off_bytes = [0u8; 8];
+    let pre = initial_buffered.len().min(8);
+    off_bytes[..pre].copy_from_slice(&initial_buffered[..pre]);
+    if pre < 8 {
+        stream
+            .read_exact(&mut off_bytes[pre..])
+            .map_err(TransferError::HandshakeFailed)?;
+    }
+    let raw_offset = decode_file_offset(&off_bytes).map_err(|e| {
+        TransferError::HandshakeFailed(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    })?;
+    // Soulseek NS >2 GiB bug sends u64::MAX (-1) on resume; fall back to 0 rather than corrupting.
+    let start_offset = if raw_offset == u64::MAX {
+        0
+    } else if raw_offset > total_size {
+        return Err(TransferError::InvalidDestination(format!(
+            "peer requested offset {raw_offset} past file size {total_size}"
+        )));
+    } else {
+        raw_offset
+    };
+
+    if start_offset > 0 {
+        file.seek(SeekFrom::Start(start_offset))
+            .map_err(TransferError::ReadFailed)?;
+    }
+
+    if let Some(cb) = on_progress {
+        cb(TransferProgress {
+            bytes_downloaded: start_offset,
+            total_bytes: total_size,
+            speed_bytes_per_sec: 0.0,
+            queue_place: None,
+            phase: TransferPhase::Transferring,
+        });
+    }
+
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(TransferError::WriteFailed)?;
+
+    let mut buf = vec![0u8; READ_CHUNK_BYTES];
+    let mut sent: u64 = 0;
+    let remaining_total = total_size.saturating_sub(start_offset);
+    let transfer_start = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut window_start = Instant::now();
+    let mut window_bytes = 0usize;
+
+    while sent < remaining_total {
+        if cancel.load(Ordering::Acquire) {
+            return Err(TransferError::Cancelled);
+        }
+        let want = ((remaining_total - sent) as usize).min(READ_CHUNK_BYTES);
+        let n = file
+            .read(&mut buf[..want])
+            .map_err(TransferError::ReadFailed)?;
+        if n == 0 {
+            return Err(TransferError::Incomplete {
+                received: start_offset + sent,
+                expected: total_size,
+            });
+        }
+
+        let mut written = 0usize;
+        while written < n {
+            if cancel.load(Ordering::Acquire) {
+                return Err(TransferError::Cancelled);
+            }
+            match stream.write(&buf[written..n]) {
+                Ok(0) => {
+                    return Err(TransferError::WriteFailed(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "peer closed upload socket early",
+                    )));
+                }
+                Ok(w) => {
+                    written += w;
+                    sent += w as u64;
+                    window_bytes += w;
+                    last_activity = Instant::now();
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if last_activity.elapsed() >= STALL_TIMEOUT {
+                        return Err(TransferError::Stalled);
+                    }
+                }
+                Err(e) => return Err(TransferError::WriteFailed(e)),
+            }
+        }
+
+        if window_bytes >= PROGRESS_REPORT_BYTES || sent >= remaining_total {
+            let elapsed = window_start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                window_bytes as f64 / elapsed
+            } else {
+                0.0
+            };
+            if let Some(cb) = on_progress {
+                cb(TransferProgress {
+                    bytes_downloaded: start_offset + sent,
+                    total_bytes: total_size,
+                    speed_bytes_per_sec: speed,
+                    queue_place: None,
+                    phase: TransferPhase::Transferring,
+                });
+            }
+            window_bytes = 0;
+            window_start = Instant::now();
+        }
+    }
+
+    stream.flush().map_err(TransferError::WriteFailed)?;
+
+    // Per SLSKPROTOCOL: downloader closes the F connection once all expected bytes arrive.
+    // Wait briefly for peer FIN so buffered kernel bytes flush cleanly before dropping our handle.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut fin = [0u8; 1];
+    let _ = stream.read(&mut fin);
+    drop(stream);
+
+    let total_elapsed = transfer_start.elapsed().as_secs_f64();
+    let avg_speed = if total_elapsed > 0.0 && sent > 0 {
+        (sent as f64 / total_elapsed).min(f64::from(u32::MAX)) as u32
+    } else {
+        0
+    };
+
+    if let Some(cb) = on_progress {
+        cb(TransferProgress {
+            bytes_downloaded: total_size,
+            total_bytes: total_size,
+            speed_bytes_per_sec: f64::from(avg_speed),
+            queue_place: None,
+            phase: TransferPhase::Completed,
+        });
+    }
+
+    Ok(UploadOutcome {
+        path: local_path,
+        size: total_size,
+        start_offset,
+        bytes_sent: sent,
+        speed_bytes_per_sec: avg_speed,
+    })
 }

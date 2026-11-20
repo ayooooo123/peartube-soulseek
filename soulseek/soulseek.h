@@ -88,6 +88,13 @@ void slsk_client_set_logger(
   void *ctx
 );
 
+void slsk_client_configure_share(
+  const slsk_client_t *client,
+  const char *share_dir,
+  uint8_t enabled,
+  uint32_t max_files
+);
+
 void slsk_client_login_async(
   const slsk_client_t *client,
   const char *server,

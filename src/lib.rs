@@ -6,7 +6,9 @@ pub mod proto;
 pub mod transfer;
 
 pub use client::{
-    ClientError, ClientOptions, ClientState, LogEvent, LogLevel, LoggerHook, SoulseekClient,
+    ClientError, ClientOptions, ClientState, DEFAULT_SHARE_MAX_FILES, DEFAULT_UPLOAD_QUEUE_CAP,
+    DEFAULT_UPLOAD_SLOTS, LogEvent, LogLevel, LoggerHook, SHARE_VIRTUAL_ROOT, SoulseekClient,
+    USER_INFO_DESCRIPTION, UserStats, format_share_decision_json,
 };
 pub use proto::{
     AudioAttributes, ConnectionType, DEFAULT_MAJOR_VERSION, DEFAULT_MINOR_VERSION,
@@ -16,4 +18,5 @@ pub use proto::{
 };
 pub use transfer::{
     DownloadOutcome, PartWriter, ProgressCallback, TransferError, TransferPhase, TransferProgress,
+    UploadOutcome,
 };

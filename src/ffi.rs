@@ -5,6 +5,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 use std::thread;
@@ -209,6 +210,34 @@ pub unsafe extern "C" fn slsk_client_set_logger(
         }
         None => handle.inner.set_logger(None),
     }
+}
+
+/// # Safety
+/// `client` must be either null or a valid live pointer returned by `slsk_client_new`.
+/// `share_dir` must be either null or a valid NUL-terminated UTF-8 C string for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slsk_client_configure_share(
+    client: *const SlskClientHandle,
+    share_dir: *const c_char,
+    enabled: u8,
+    max_files: u32,
+) {
+    if client.is_null() {
+        return;
+    }
+    let inner = unsafe { Arc::clone(&(*client).inner) };
+    let dir_opt = if share_dir.is_null() {
+        None
+    } else {
+        let s = unsafe { cstr_to_string(share_dir) };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    };
+    let _ = inner.configure_share(dir_opt, enabled != 0, max_files as usize);
 }
 
 /// # Safety

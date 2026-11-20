@@ -47,12 +47,25 @@ test/
 ## Protocol Coverage (v1)
 
 - **Implemented:**
-  - Server login (`Login` code 1, major `177`, minor `1`, single-message `md5(username + password)` lowercase hex digest), `SetWaitPort` (2), `GetPeerAddress` (3), `WatchUser` (5), `UnwatchUser` (6), `GetUserStatus` (7), `ConnectToPeer` (18), `MessageUser` (22) + `MessageAcked` (23), `FileSearch` (26), `SetStatus` (28), `ServerPing` (32) keepalive + auto-reconnect backoff, `SharedFoldersFiles` (35), `GetUserStats` (36), `Relogged` (41), `CheckPrivileges` (92), `AcceptChildren` (100), `HaveNoParent` (71), `CantConnectToPeer` (1001).
+  - Server login (`Login` code 1, major `177`, minor `1`, single-message `md5(username + password)` lowercase hex digest), `SetWaitPort` (2), `GetPeerAddress` (3), `WatchUser` (5), `UnwatchUser` (6), `GetUserStatus` (7), `ConnectToPeer` (18), `MessageUser` (22) + `MessageAcked` (23), `FileSearch` (26), `SetStatus` (28), `ServerPing` (32) keepalive + auto-reconnect backoff, `SharedFoldersFiles` (35), `GetUserStats` (36), `Relogged` (41), `CheckPrivileges` (92), `AcceptChildren` (100), `HaveNoParent` (71), `SendUploadSpeed` (121), `CantConnectToPeer` (1001).
   - Peer Init (`PierceFirewall` 0, `PeerInit` 1) for both direct outbound/inbound `P` & `F` sockets and server-brokered NAT traversal (`ConnectToPeer`).
-  - Peer `P` messages: `SharedFileListRequest` (4), `SharedFileListResponse` (5, zlib), `FileSearchResponse` (9, zlib, including Soulseek NS >2 GiB uint64 bug workaround and Latin-1 fallback), `UserInfoRequest` (15), `UserInfoResponse` (16), `FolderContentsRequest` (36), `FolderContentsResponse` (37), `TransferRequest` (40), `TransferResponse` (41), `QueueUpload` (43), `PlaceInQueueResponse` (44), `UploadFailed` (46), `UploadDenied` (50), `PlaceInQueueRequest` (51).
-  - File `F` stream: 4-byte `FileTransferInit` ticket matching, 8-byte little-endian `FileOffset` `.part` resume, chunked disk writes, downloader-initiated socket close on exact byte count.
+  - Peer `P` messages: `SharedFileListRequest` (4), `SharedFileListResponse` (5, zlib), `FileSearchResponse` (9, zlib, including Soulseek NS >2 GiB uint64 bug workaround and Latin-1 fallback), `UserInfoRequest` (15), `UserInfoResponse` (16), `FolderContentsRequest` (36), `FolderContentsResponse` (37, zlib), `TransferRequest` (40), `TransferResponse` (41), `QueueUpload` (43), `PlaceInQueueResponse` (44), `UploadFailed` (46), `UploadDenied` (50), `PlaceInQueueRequest` (51).
+  - File `F` stream (both download and upload): 4-byte `FileTransferInit` ticket matching, 8-byte little-endian `FileOffset` `.part` resume, chunked disk I/O, downloader-initiated socket close on exact byte count.
+  - Opt-in local disk sharing & bounded P2P uploads: indexes one-level album folders (`Artist - Album (Year)/NN - Title.ext`) under the watched import folder up to a bounded file cap, answers `SharedFileListRequest`, `FolderContentsRequest`, `UserInfoRequest`, and server-forwarded `FileSearch` queries, and serves uploads with bounded slots (`2`) and queue depth (`32`) off-thread so downloads never stall.
 - **Not implemented in v1:**
-  - Chat rooms, private chat UI, recommendations/interests, wishlist scheduler, user/room-scoped searches, serving local shares/uploads to peers, distributed child fan-out (`AcceptChildren` is explicitly `false`), and rotated/obfuscated peer ports. See `NOTES.md` for the complete message table.
+  - Chat rooms, private chat UI, recommendations/interests, wishlist scheduler, user/room-scoped searches, distributed child fan-out (`AcceptChildren` is explicitly `false`), and rotated/obfuscated peer ports. See `NOTES.md` for the complete message table.
+
+## Local Share & Upload Environment Variables (Opt-In)
+
+Sharing is **opt-in** (defaults **off**) so private files in an operator's import folder are never published to the Soulseek network unless explicitly enabled. At client startup (and whenever reconfigured), a structured JSON line is emitted on stderr (`{"msg":"soulseek share","enabled":false,"files":0}` when off, or `{"msg":"soulseek share","enabled":true,"files":N,"dir":"..."}` when on).
+
+When enabled, a share exposes the media files on disk inside the relay's one-level album folders (`@@peartube\Artist - Album (Year)\NN - Title.ext`, skipping dot files, `@eaDir`, `.part`/`.json` sidecars, and symlinks), capped at `PEARTUBE_SLSK_SHARE_MAX_FILES` files. When disabled, the client advertises `SharedFoldersFiles { folders: 0, files: 0 }` and answers `UserInfoRequest` honestly with `upload_slots: 0` and `slot_free: false`.
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `PEARTUBE_SLSK_SHARE` | `0` (off) | Set to `1` (or `true`) to advertise and serve local disk shares to Soulseek peers. Unset, `0`, or `false` keeps sharing disabled. |
+| `PEARTUBE_SLSK_SHARE_DIR` | `PEARTUBE_WATCH_DIR`, else `<PEARTUBE_STORAGE>/staging` | Override the root directory scanned for one-level `Artist - Album (Year)/NN - Title.ext` album folders when `PEARTUBE_SLSK_SHARE=1`. |
+| `PEARTUBE_SLSK_SHARE_MAX_FILES` | `2000` | Maximum number of media files indexed and advertised in `SharedFoldersFiles` and `SharedFileListResponse`. |
 
 ## Build & Test Commands
 

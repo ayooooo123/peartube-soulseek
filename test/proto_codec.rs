@@ -8,7 +8,7 @@ use peartube_soulseek::proto::{
     DistributedMessage, FrameDecoder, LoginRejectReason, PeerInitMessage, PeerMessage, ProtoError,
     ServerRequest, ServerResponse, SharedFolder, WireFileEntry, WireWriter, decode_file_offset,
     decode_file_transfer_init, encode_file_offset, encode_file_transfer_init,
-    flatten_shared_folders, login_checksum, md5_hex, server_code, zlib_compress,
+    flatten_shared_folders, login_checksum, md5_hex, server_code, zlib_compress, zlib_decompress,
 };
 
 fn unhex(hex: &str) -> Vec<u8> {
@@ -617,4 +617,101 @@ fn hostile_frames_fail_safely_without_panicking() {
     // Claim 999_999 privileged users in an 8-byte payload
     let bogus = unhex("450000003f420f00");
     assert!(ServerResponse::decode(&bogus).is_err());
+}
+
+#[test]
+fn user_info_response_with_free_slot_and_shared_folder_list_exact_hex_fixtures() {
+    // 1. Exact wire bytes of a free-slot `UserInfoResponse` (peer code 16 = 0x10):
+    //    [len=45 (0x2d000000)]
+    //    [code=16 (0x10000000)]
+    //    [description="PearTube Soulseek Relay" (len=23 = 0x17000000 + ASCII)]
+    //    [has_picture=false (0x00)]
+    //    [upload_slots=2 (0x02000000)]
+    //    [queue_length=0 (0x00000000)]
+    //    [slot_free=true (0x01)]
+    //    [upload_permission=0 (0x00000000)]
+    let expected_userinfo_hex = "\
+        2d000000\
+        10000000\
+        17000000506561725475626520536f756c7365656b2052656c6179\
+        00\
+        02000000\
+        00000000\
+        01\
+        00000000";
+
+    let userinfo = PeerMessage::UserInfoResponse {
+        description: "PearTube Soulseek Relay".to_string(),
+        picture: None,
+        upload_slots: 2,
+        queue_length: 0,
+        slot_free: true,
+        upload_permission: Some(0),
+    };
+    let encoded_userinfo = userinfo.encode().unwrap();
+    assert_eq!(to_hex(&encoded_userinfo), expected_userinfo_hex);
+    assert_eq!(
+        PeerMessage::decode(strip_len_prefix(&unhex(expected_userinfo_hex))).unwrap(),
+        userinfo
+    );
+
+    // 2. Exact uncompressed + framed wire bytes of a `SharedFolder` list inside `SharedFileListResponse` (peer code 5):
+    //    - public folders = 1 (`01000000`)
+    //      - folder path = "@@peartube\\Burial - Untrue (2007)" (len=33 = `21000000` + ASCII)
+    //      - files = 1 (`01000000`)
+    //        - code = 1 (`01`)
+    //        - basename = "02 - Archangel.flac" (len=19 = `13000000` + ASCII)
+    //        - size = 28_500_000 (`20e0b20100000000`)
+    //        - extension = "" (`00000000`)
+    //        - attributes = 3 (`03000000`):
+    //          - DURATION(1)=238 (`01000000 ee000000`)
+    //          - SAMPLE_RATE(4)=44100 (`04000000 44ac0000`)
+    //          - BIT_DEPTH(5)=16 (`05000000 10000000`)
+    //    - unknown = 0 (`00000000`)
+    //    - private folders = 0 (`00000000`)
+    let expected_uncompressed_folder_list_hex = "\
+        01000000\
+        21000000404070656172747562655c42757269616c202d20556e7472756520283230303729\
+        01000000\
+        01\
+        130000003032202d2041726368616e67656c2e666c6163\
+        20e0b20100000000\
+        00000000\
+        03000000\
+        01000000ee000000\
+        0400000044ac0000\
+        0500000010000000\
+        00000000\
+        00000000";
+
+    let shared_list = PeerMessage::SharedFileListResponse {
+        folders: vec![SharedFolder {
+            path: "@@peartube\\Burial - Untrue (2007)".to_string(),
+            files: vec![WireFileEntry {
+                filename: "02 - Archangel.flac".to_string(),
+                size: 28_500_000,
+                extension: String::new(),
+                attrs: AudioAttributes {
+                    bitrate: None,
+                    length_secs: Some(238),
+                    vbr: None,
+                    sample_rate: Some(44_100),
+                    bit_depth: Some(16),
+                },
+            }],
+        }],
+        private_folders: Vec::new(),
+    };
+    let encoded_list = shared_list.encode().unwrap();
+    let payload = strip_len_prefix(&encoded_list);
+    assert_eq!(&payload[..4], &5u32.to_le_bytes());
+    let decompressed = zlib_decompress(&payload[4..]).unwrap();
+    assert_eq!(to_hex(&decompressed), expected_uncompressed_folder_list_hex);
+    assert_eq!(PeerMessage::decode(payload).unwrap(), shared_list);
+
+    // Also verify SendUploadSpeed (server code 121 = 0x79) exact hex
+    assert_eq!(
+        to_hex(&ServerRequest::SendUploadSpeed { speed: 1_048_576 }.encode()),
+        "080000007900000000001000"
+    );
 }

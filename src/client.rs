@@ -1,5 +1,6 @@
 //! Multi-threaded non-blocking Soulseek client session, peer connection broker,
-//! search collector, peer share browser, and ticket-matched download coordinator.
+//! search collector, peer share browser, disk share publisher, and ticket-matched
+//! download/upload coordinator.
 //!
 //! Security & logging rules:
 //! - Credentials (`password`) are never logged at any level and never auto-generated.
@@ -7,9 +8,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -17,13 +19,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::proto::{
-    ConnectionType, DEFAULT_MAJOR_VERSION, DEFAULT_MINOR_VERSION, FrameDecoder, PeerInitMessage,
-    PeerMessage, ProtoError, ServerRequest, ServerResponse, SharedFileRecord,
-    flatten_shared_folders,
+    AudioAttributes, ConnectionType, DEFAULT_MAJOR_VERSION, DEFAULT_MINOR_VERSION, FrameDecoder,
+    PeerInitMessage, PeerMessage, ProtoError, ServerRequest, ServerResponse, SharedFileRecord,
+    SharedFolder, WireFileEntry, flatten_shared_folders,
 };
 use crate::transfer::{
     DownloadOutcome, ProgressCallback, TransferError, TransferPhase, TransferProgress,
-    dial_pierced_file_socket, redacted_basename, resolve_dest_file, stream_file_download,
+    UploadOutcome, dial_direct_upload_socket, dial_pierced_file_socket, init_pierced_upload_socket,
+    redacted_basename, resolve_dest_file, stream_file_download, stream_file_upload,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -37,6 +40,19 @@ const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PLACE_IN_QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SEARCH_FILES: usize = 10_000;
+const SHARE_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+const UPLOAD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default file count cap for the advertised Soulseek share tree.
+pub const DEFAULT_SHARE_MAX_FILES: usize = 2000;
+/// Default concurrent upload slots advertised in `UserInfoResponse`.
+pub const DEFAULT_UPLOAD_SLOTS: u32 = 2;
+/// Maximum queued uploads accepted before answering `UploadDenied("Too many files")`.
+pub const DEFAULT_UPLOAD_QUEUE_CAP: usize = 32;
+/// Virtual Soulseek root prefix used for advertised album directories.
+pub const SHARE_VIRTUAL_ROOT: &str = "@@peartube";
+/// User info description advertised to peers browsing our user profile.
+pub const USER_INFO_DESCRIPTION: &str = "PearTube Soulseek Relay";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -75,14 +91,32 @@ pub struct ClientState {
     pub listen_port: u16,
 }
 
-/// Options for configuring background server keepalive, read liveness, and reconnect intervals.
-#[derive(Debug, Clone, Copy)]
+/// Server-tracked upload speed and shared folder/file counts returned by `GetUserStats` (code 36).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserStats {
+    pub username: String,
+    pub upload_speed: u32,
+    pub upload_count: u32,
+    pub files: u32,
+    pub folders: u32,
+}
+
+/// Options for configuring background server keepalive, read liveness, reconnect intervals,
+/// and local disk sharing (`slskShare` / `PEARTUBE_SLSK_SHARE` and `PEARTUBE_SLSK_SHARE_MAX_FILES`).
+#[derive(Debug, Clone)]
 pub struct ClientOptions {
     pub listen_port: u16,
     pub ping_interval: Duration,
     pub server_read_timeout: Duration,
     pub reconnect_backoff_min: Duration,
     pub reconnect_backoff_max: Duration,
+    /// Explicit directory to share; when `None` and `share_enabled` is `true`, resolves from
+    /// `PEARTUBE_SLSK_SHARE_DIR`, `PEARTUBE_WATCH_DIR`, or `<PEARTUBE_STORAGE>/staging`.
+    pub share_dir: Option<PathBuf>,
+    /// Opt-in share toggle (`PEARTUBE_SLSK_SHARE=1`, default `false` so private libraries are never published silently).
+    pub share_enabled: bool,
+    /// Maximum number of media files indexed and advertised (`DEFAULT_SHARE_MAX_FILES = 2000`).
+    pub share_max_files: usize,
 }
 
 impl Default for ClientOptions {
@@ -93,6 +127,9 @@ impl Default for ClientOptions {
             server_read_timeout: SERVER_READ_TIMEOUT,
             reconnect_backoff_min: RECONNECT_BACKOFF_MIN,
             reconnect_backoff_max: RECONNECT_BACKOFF_MAX,
+            share_dir: default_share_dir_from_env(),
+            share_enabled: default_share_enabled_from_env(),
+            share_max_files: default_share_max_files_from_env(),
         }
     }
 }
@@ -179,6 +216,113 @@ struct ActiveDownload {
     reply: Option<Sender<Result<DownloadOutcome, ClientError>>>,
 }
 
+#[derive(Clone)]
+struct SharedLocalFile {
+    virtual_path: String,
+    local_path: PathBuf,
+    size: u64,
+    attrs: AudioAttributes,
+    search_haystack: String,
+}
+
+#[derive(Default, Clone)]
+struct ShareSnapshot {
+    folders: Vec<SharedFolder>,
+    files: Vec<SharedLocalFile>,
+    by_key: HashMap<String, usize>,
+}
+
+impl ShareSnapshot {
+    fn folder_count(&self) -> u32 {
+        self.folders.len() as u32
+    }
+
+    fn file_count(&self) -> u32 {
+        self.files.len() as u32
+    }
+
+    fn lookup(&self, requested_path: &str) -> Option<&SharedLocalFile> {
+        let norm = normalize_virtual_key(requested_path);
+        self.by_key.get(&norm).and_then(|&idx| self.files.get(idx))
+    }
+
+    fn folder_contents(&self, requested_folder: &str) -> Vec<SharedFolder> {
+        let norm = requested_folder
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        if norm.is_empty() {
+            return Vec::new();
+        }
+        let prefix_with_sep = format!("{norm}\\");
+        self.folders
+            .iter()
+            .filter(|dir| {
+                let dir_norm = dir
+                    .path
+                    .replace('/', "\\")
+                    .trim_end_matches('\\')
+                    .to_ascii_lowercase();
+                dir_norm == norm || dir_norm.starts_with(&prefix_with_sep)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn search_matches(&self, query: &str, cap: usize) -> Vec<WireFileEntry> {
+        let terms: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for f in &self.files {
+            if terms.iter().all(|t| f.search_haystack.contains(t.as_str())) {
+                hits.push(WireFileEntry {
+                    filename: f.virtual_path.clone(),
+                    size: f.size,
+                    extension: String::new(),
+                    attrs: f.attrs.clone(),
+                });
+                if hits.len() >= cap {
+                    break;
+                }
+            }
+        }
+        hits
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UploadSocketState {
+    Queued,
+    WaitingTransferResponse { offered_at: Instant },
+    Connecting { started_at: Instant },
+    Transferring,
+}
+
+struct ActiveUpload {
+    id: u64,
+    username: String,
+    virtual_path: String,
+    local_path: PathBuf,
+    file_size: u64,
+    transfer_token: Option<u32>,
+    connect_token: Option<u32>,
+    state: UploadSocketState,
+    in_flight_socket: Option<Arc<Mutex<TcpStream>>>,
+    cancel: Arc<AtomicBool>,
+    progress: Option<ProgressCallback>,
+}
+
+struct ActiveUserStatsQuery {
+    deadline: Instant,
+    reply: Sender<Result<UserStats, ClientError>>,
+}
+
 enum WorkerCmd {
     Login {
         creds: Credentials,
@@ -202,6 +346,17 @@ enum WorkerCmd {
         cancel: Arc<AtomicBool>,
         progress: Option<ProgressCallback>,
         reply: Sender<Result<DownloadOutcome, ClientError>>,
+    },
+    UserStats {
+        username: String,
+        timeout: Duration,
+        reply: Sender<Result<UserStats, ClientError>>,
+    },
+    ConfigureShare {
+        share_dir: Option<PathBuf>,
+        share_enabled: bool,
+        share_max_files: usize,
+        reply: Sender<(u32, u32)>,
     },
     Shutdown,
 }
@@ -242,6 +397,15 @@ enum WorkerEvent {
     TransferFinished {
         download_id: u64,
         result: Result<DownloadOutcome, TransferError>,
+    },
+    UploadSocketConnected {
+        upload_id: u64,
+        stream: TcpStream,
+        buffered: Vec<u8>,
+    },
+    UploadFinished {
+        upload_id: u64,
+        result: Result<UploadOutcome, TransferError>,
     },
 }
 
@@ -524,6 +688,47 @@ impl SoulseekClient {
             .map_err(|_| ClientError::Disconnected("worker dropped download reply".to_string()))?
     }
 
+    /// Query server-side user stats (`GetUserStats`, server code 36) for `username`.
+    pub fn user_stats(&self, username: &str, timeout: Duration) -> Result<UserStats, ClientError> {
+        let u = username.trim();
+        if u.is_empty() {
+            return Err(ClientError::InvalidCredentials(
+                "username is empty".to_string(),
+            ));
+        }
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(WorkerCmd::UserStats {
+                username: u.to_owned(),
+                timeout,
+                reply: tx,
+            })
+            .map_err(|_| ClientError::Disconnected("worker stopped".to_string()))?;
+        rx.recv()
+            .map_err(|_| ClientError::Disconnected("worker dropped user_stats reply".to_string()))?
+    }
+
+    /// Update the local disk share configuration (`share_dir`, `share_enabled`, `share_max_files`)
+    /// at runtime, immediately rescanning and advertising updated `SharedFoldersFiles` counts
+    /// if logged in. Returns `(folders, files)`.
+    pub fn configure_share(
+        &self,
+        share_dir: Option<PathBuf>,
+        share_enabled: bool,
+        share_max_files: usize,
+    ) -> Result<(u32, u32), ClientError> {
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(WorkerCmd::ConfigureShare {
+                share_dir,
+                share_enabled,
+                share_max_files,
+                reply: tx,
+            })
+            .map_err(|_| ClientError::Disconnected("worker stopped".to_string()))?;
+        rx.recv()
+            .map_err(|_| ClientError::Disconnected("worker dropped share reply".to_string()))
+    }
     pub fn close(&self) {
         if !self.shutdown.swap(true, Ordering::AcqRel) {
             let _ = self.cmd_tx.send(WorkerCmd::Shutdown);
@@ -569,6 +774,12 @@ struct WorkerEngine {
     browses: HashMap<String, ActiveBrowse>,
     downloads: Vec<ActiveDownload>,
     next_download_id: u64,
+    share: ShareSnapshot,
+    last_share_scan: Instant,
+    uploads: Vec<ActiveUpload>,
+    next_upload_id: u64,
+    last_upload_speed: u32,
+    user_stats_queries: HashMap<String, Vec<ActiveUserStatsQuery>>,
 }
 
 impl WorkerEngine {
@@ -580,7 +791,8 @@ impl WorkerEngine {
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         let now = Instant::now();
-        Self {
+        let share = scan_share_snapshot(&options);
+        let engine = Self {
             event_tx,
             state,
             logger,
@@ -602,7 +814,15 @@ impl WorkerEngine {
             browses: HashMap::new(),
             downloads: Vec::new(),
             next_download_id: 1,
-        }
+            share,
+            last_share_scan: now,
+            uploads: Vec::new(),
+            next_upload_id: 1,
+            last_upload_speed: 0,
+            user_stats_queries: HashMap::new(),
+        };
+        engine.emit_share_decision_log();
+        engine
     }
 
     fn log(&self, level: LogLevel, event: &str, message: impl Into<String>) {
@@ -856,6 +1076,19 @@ impl WorkerEngine {
                 let _ = reply.send(Err(ClientError::Disconnected(reason.to_owned())));
             }
         }
+        for (_, waiting) in self.user_stats_queries.drain() {
+            for q in waiting {
+                let _ = q
+                    .reply
+                    .send(Err(ClientError::Disconnected(reason.to_owned())));
+            }
+        }
+        for mut up in self.uploads.drain(..) {
+            up.cancel.store(true, Ordering::Release);
+            if let Some(sock) = up.in_flight_socket.take() {
+                let _ = sock.lock().shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
 
     fn disconnect_server(&mut self) {
@@ -1010,9 +1243,10 @@ impl WorkerEngine {
                         port: u32::from(self.options.listen_port),
                     });
                 }
+                self.refresh_share(false);
                 let _ = self.send_server(&ServerRequest::SharedFoldersFiles {
-                    folders: 0,
-                    files: 0,
+                    folders: self.share.folder_count(),
+                    files: self.share.file_count(),
                 });
                 let _ = self.send_server(&ServerRequest::AcceptChildren { accept: false });
                 let _ = self.send_server(&ServerRequest::HaveNoParent { no_parent: true });
@@ -1026,8 +1260,11 @@ impl WorkerEngine {
                     LogLevel::Info,
                     "logged_in",
                     format!(
-                        "logged in as {} (listen_port={})",
-                        creds.username, self.options.listen_port
+                        "logged in as {} (listen_port={}, shared_folders={}, shared_files={})",
+                        creds.username,
+                        self.options.listen_port,
+                        self.share.folder_count(),
+                        self.share.file_count()
                     ),
                 );
                 Ok(self.state.read().clone())
@@ -1122,7 +1359,8 @@ impl WorkerEngine {
             ServerResponse::PeerAddress {
                 username, ip, port, ..
             } => {
-                self.dial_peer_direct(username, ip, port);
+                self.dial_peer_direct(username.clone(), ip, port);
+                self.dial_pending_uploads_direct(&username, ip, port);
             }
             ServerResponse::ConnectToPeer {
                 username,
@@ -1145,6 +1383,33 @@ impl WorkerEngine {
             ServerResponse::MessageUser { message_id, .. } => {
                 let _ = self.send_server(&ServerRequest::MessageAcked { message_id });
             }
+            ServerResponse::FileSearch {
+                username,
+                token,
+                query,
+            } => {
+                self.handle_incoming_file_search(username, token, &query);
+            }
+            ServerResponse::UserStats {
+                username,
+                upload_speed,
+                upload_count,
+                files,
+                folders,
+            } => {
+                if let Some(waiters) = self.user_stats_queries.remove(&username) {
+                    let stats = UserStats {
+                        username,
+                        upload_speed,
+                        upload_count,
+                        files,
+                        folders,
+                    };
+                    for w in waiters {
+                        let _ = w.reply.send(Ok(stats.clone()));
+                    }
+                }
+            }
             ServerResponse::CantConnectToPeer { token } => {
                 if let Some((username, _)) = self.pending_connect_tokens.remove(&token)
                     && !self.peers.contains_key(&username)
@@ -1153,6 +1418,20 @@ impl WorkerEngine {
                         &username,
                         "peer could not establish indirect connection",
                     );
+                }
+                if let Some(idx) = self
+                    .uploads
+                    .iter()
+                    .position(|u| u.connect_token == Some(token) && u.in_flight_socket.is_none())
+                {
+                    let up = self.uploads.remove(idx);
+                    let _ = self.ensure_peer_control(
+                        &up.username,
+                        PeerMessage::UploadFailed {
+                            filename: up.virtual_path,
+                        },
+                    );
+                    self.pump_upload_slots();
                 }
             }
             ServerResponse::PossibleParents { parents } => {
@@ -1377,6 +1656,39 @@ impl WorkerEngine {
                         Arc::clone(&self.logger),
                     );
                 } else if self.server_stream.is_some()
+                    && let Some(idx) = self.uploads.iter().position(|u| {
+                        u.connect_token == Some(connect_token)
+                            && matches!(u.state, UploadSocketState::Connecting { .. })
+                            && u.in_flight_socket.is_none()
+                    })
+                {
+                    let upload_id = self.uploads[idx].id;
+                    let Some(transfer_token) = self.uploads[idx].transfer_token else {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    };
+                    let buffered = decoder.take_all();
+                    let tx = self.event_tx.clone();
+                    let _ = thread::Builder::new()
+                        .name("slsk-pierce-tx-f".to_string())
+                        .spawn(
+                            move || match init_pierced_upload_socket(stream, transfer_token) {
+                                Ok(ready_stream) => {
+                                    let _ = tx.send(WorkerEvent::UploadSocketConnected {
+                                        upload_id,
+                                        stream: ready_stream,
+                                        buffered,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(WorkerEvent::UploadFinished {
+                                        upload_id,
+                                        result: Err(e),
+                                    });
+                                }
+                            },
+                        );
+                } else if self.server_stream.is_some()
                     && self
                         .downloads
                         .iter()
@@ -1444,6 +1756,20 @@ impl WorkerEngine {
                 result,
             } => {
                 self.finish_download(download_id, result);
+            }
+            WorkerEvent::UploadSocketConnected {
+                upload_id,
+                stream,
+                buffered,
+            } => {
+                if self.server_stream.is_none() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                self.start_matched_file_upload(upload_id, stream, buffered);
+            }
+            WorkerEvent::UploadFinished { upload_id, result } => {
+                self.finish_upload(upload_id, result);
             }
         }
     }
@@ -1609,6 +1935,38 @@ impl WorkerEngine {
                     reply: Some(reply),
                 });
             }
+            WorkerCmd::UserStats {
+                username,
+                timeout,
+                reply,
+            } => {
+                if let Err(e) = self.send_server(&ServerRequest::GetUserStats {
+                    username: username.clone(),
+                }) {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+                self.user_stats_queries
+                    .entry(username)
+                    .or_default()
+                    .push(ActiveUserStatsQuery {
+                        deadline: Instant::now() + timeout,
+                        reply,
+                    });
+            }
+            WorkerCmd::ConfigureShare {
+                share_dir,
+                share_enabled,
+                share_max_files,
+                reply,
+            } => {
+                self.options.share_dir = share_dir;
+                self.options.share_enabled = share_enabled;
+                self.options.share_max_files = share_max_files;
+                self.refresh_share(true);
+                self.emit_share_decision_log();
+                let _ = reply.send((self.share.folder_count(), self.share.file_count()));
+            }
             WorkerCmd::Shutdown => {
                 self.shutdown.store(true, Ordering::Release);
             }
@@ -1751,9 +2109,26 @@ impl WorkerEngine {
             PeerMessage::TransferRequest {
                 direction: 0,
                 token,
+                filename,
                 ..
             } => {
-                if let Some((_, writer)) = self.peers.get(&username) {
+                // Legacy download request (used by slskd / Seeker). Per SLSKPROTOCOL Peer Code 41a:
+                // reject with "Queued" if shared and enqueue via normal upload path so we initiate
+                // the F connection to a server-verified peer address; otherwise reject "File not shared.".
+                if self.options.share_enabled && self.share.lookup(&filename).is_some() {
+                    if let Some((_, writer)) = self.peers.get(&username) {
+                        let _ = Self::write_peer_msg(
+                            writer,
+                            &PeerMessage::TransferResponse {
+                                token,
+                                allowed: false,
+                                file_size: None,
+                                reason: Some("Queued".to_string()),
+                            },
+                        );
+                    }
+                    self.enqueue_peer_upload(username, filename);
+                } else if let Some((_, writer)) = self.peers.get(&username) {
                     let _ = Self::write_peer_msg(
                         writer,
                         &PeerMessage::TransferResponse {
@@ -1761,6 +2136,43 @@ impl WorkerEngine {
                             allowed: false,
                             file_size: None,
                             reason: Some("File not shared.".to_string()),
+                        },
+                    );
+                }
+            }
+            PeerMessage::TransferResponse {
+                token,
+                allowed,
+                reason,
+                ..
+            } => {
+                self.handle_upload_transfer_response(&username, token, allowed, reason);
+            }
+            PeerMessage::QueueUpload { filename } => {
+                self.enqueue_peer_upload(username, filename);
+            }
+            PeerMessage::PlaceInQueueRequest { filename } => {
+                if let Some(place) = self.upload_queue_place(&username, &filename) {
+                    let _ = self.ensure_peer_control(
+                        &username,
+                        PeerMessage::PlaceInQueueResponse { filename, place },
+                    );
+                }
+            }
+            PeerMessage::FolderContentsRequest { token, folder } => {
+                self.refresh_share_if_stale();
+                let folders = if self.options.share_enabled {
+                    self.share.folder_contents(&folder)
+                } else {
+                    Vec::new()
+                };
+                if let Some((_, writer)) = self.peers.get(&username) {
+                    let _ = Self::write_peer_msg(
+                        writer,
+                        &PeerMessage::FolderContentsResponse {
+                            token,
+                            root_folder: folder,
+                            folders,
                         },
                     );
                 }
@@ -1811,26 +2223,33 @@ impl WorkerEngine {
                 }
             }
             PeerMessage::SharedFileListRequest => {
+                self.refresh_share_if_stale();
+                let folders = if self.options.share_enabled {
+                    self.share.folders.clone()
+                } else {
+                    Vec::new()
+                };
                 if let Some((_, writer)) = self.peers.get(&username) {
                     let _ = Self::write_peer_msg(
                         writer,
                         &PeerMessage::SharedFileListResponse {
-                            folders: Vec::new(),
+                            folders,
                             private_folders: Vec::new(),
                         },
                     );
                 }
             }
             PeerMessage::UserInfoRequest => {
+                let (upload_slots, queue_length, slot_free) = self.upload_slot_status();
                 if let Some((_, writer)) = self.peers.get(&username) {
                     let _ = Self::write_peer_msg(
                         writer,
                         &PeerMessage::UserInfoResponse {
-                            description: String::new(),
+                            description: USER_INFO_DESCRIPTION.to_string(),
                             picture: None,
-                            upload_slots: 0,
-                            queue_length: 0,
-                            slot_free: false,
+                            upload_slots,
+                            queue_length,
+                            slot_free,
                             upload_permission: Some(0),
                         },
                     );
@@ -1854,6 +2273,21 @@ impl WorkerEngine {
         });
 
         let Some(dl) = matched else {
+            if let Some(upload_id) = self
+                .uploads
+                .iter()
+                .find(|u| {
+                    u.transfer_token == Some(transfer_token)
+                        && matches!(u.state, UploadSocketState::Connecting { .. })
+                        && u.in_flight_socket.is_none()
+                        && username.as_ref().is_none_or(|usr| usr == &u.username)
+                })
+                .map(|u| u.id)
+            {
+                self.start_matched_file_upload(upload_id, stream, buffered);
+            } else {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
             return;
         };
 
@@ -2100,6 +2534,768 @@ impl WorkerEngine {
         for (u, f) in to_poll {
             let _ = self.ensure_peer_control(&u, PeerMessage::PlaceInQueueRequest { filename: f });
         }
+
+        // 7. Expire pending UserStats queries
+        let mut empty_stats_users = Vec::new();
+        for (u, waiters) in &mut self.user_stats_queries {
+            let mut j = 0;
+            while j < waiters.len() {
+                if now >= waiters[j].deadline {
+                    let w = waiters.remove(j);
+                    let _ = w
+                        .reply
+                        .send(Err(ClientError::Timeout(format!("user_stats {u}"))));
+                } else {
+                    j += 1;
+                }
+            }
+            if waiters.is_empty() {
+                empty_stats_users.push(u.clone());
+            }
+        }
+        for u in empty_stats_users {
+            self.user_stats_queries.remove(&u);
+        }
+
+        // 8. Expire stalled upload handshakes (`WaitingTransferResponse` / `Connecting`)
+        let mut timed_out_uploads = Vec::new();
+        let mut k = 0;
+        while k < self.uploads.len() {
+            let expired = match self.uploads[k].state {
+                UploadSocketState::WaitingTransferResponse { offered_at } => {
+                    now.duration_since(offered_at) >= UPLOAD_HANDSHAKE_TIMEOUT
+                }
+                UploadSocketState::Connecting { started_at } => {
+                    now.duration_since(started_at) >= UPLOAD_HANDSHAKE_TIMEOUT
+                }
+                UploadSocketState::Queued | UploadSocketState::Transferring => false,
+            };
+            if expired {
+                let up = self.uploads.remove(k);
+                timed_out_uploads.push((up.username, up.virtual_path));
+            } else {
+                k += 1;
+            }
+        }
+        if !timed_out_uploads.is_empty() {
+            for (u, vpath) in timed_out_uploads {
+                let _ = self.ensure_peer_control(&u, PeerMessage::UploadFailed { filename: vpath });
+            }
+            self.pump_upload_slots();
+        }
+
+        // 9. Periodically refresh watched disk share and advertise changed counts
+        if self.server_stream.is_some()
+            && now.duration_since(self.last_share_scan) >= SHARE_RESCAN_INTERVAL
+        {
+            self.refresh_share(true);
+        }
+    }
+}
+
+impl WorkerEngine {
+    fn emit_share_decision_log(&self) {
+        let line = format_share_decision_json(&self.options, self.share.file_count());
+        eprintln!("{line}");
+        self.log(LogLevel::Debug, "soulseek_share", line);
+    }
+
+    fn refresh_share_if_stale(&mut self) {
+        if Instant::now().duration_since(self.last_share_scan) >= Duration::from_secs(10) {
+            self.refresh_share(self.server_stream.is_some());
+        }
+    }
+
+    fn refresh_share(&mut self, notify_server_if_changed: bool) {
+        let prev_counts = (self.share.folder_count(), self.share.file_count());
+        self.share = scan_share_snapshot(&self.options);
+        self.last_share_scan = Instant::now();
+        let new_counts = (self.share.folder_count(), self.share.file_count());
+        if notify_server_if_changed && new_counts != prev_counts && self.server_stream.is_some() {
+            let _ = self.send_server(&ServerRequest::SharedFoldersFiles {
+                folders: new_counts.0,
+                files: new_counts.1,
+            });
+        }
+    }
+
+    fn active_upload_slots_used(&self) -> usize {
+        self.uploads
+            .iter()
+            .filter(|u| !matches!(u.state, UploadSocketState::Queued))
+            .count()
+    }
+
+    fn queued_upload_count(&self) -> usize {
+        self.uploads
+            .iter()
+            .filter(|u| matches!(u.state, UploadSocketState::Queued))
+            .count()
+    }
+
+    fn upload_slot_status(&self) -> (u32, u32, bool) {
+        if !self.options.share_enabled {
+            return (0, 0, false);
+        }
+        let slots = DEFAULT_UPLOAD_SLOTS;
+        let active = self.active_upload_slots_used() as u32;
+        let queued = self.queued_upload_count() as u32;
+        let slot_free = active < slots && queued == 0;
+        (slots, queued, slot_free)
+    }
+
+    fn upload_queue_place(&self, username: &str, filename: &str) -> Option<u32> {
+        let mut place = 0u32;
+        for up in &self.uploads {
+            if matches!(up.state, UploadSocketState::Queued) {
+                place += 1;
+                if up.username == username && paths_match(&up.virtual_path, filename) {
+                    return Some(place);
+                }
+            }
+        }
+        None
+    }
+
+    fn handle_incoming_file_search(&mut self, requester: String, token: u32, query: &str) {
+        if !self.options.share_enabled {
+            return;
+        }
+        let Some(own_user) = self.creds.as_ref().map(|c| c.username.clone()) else {
+            return;
+        };
+        if requester == own_user {
+            return;
+        }
+        let files = self.share.search_matches(query, 50);
+        if files.is_empty() {
+            return;
+        }
+        let (_, queue_length, slot_free) = self.upload_slot_status();
+        let _ = self.ensure_peer_control(
+            &requester,
+            PeerMessage::FileSearchResponse {
+                username: own_user,
+                token,
+                files,
+                slot_free,
+                upload_speed: self.last_upload_speed,
+                queue_length,
+                private_files: Vec::new(),
+            },
+        );
+    }
+
+    fn enqueue_peer_upload(&mut self, username: String, filename: String) {
+        self.refresh_share_if_stale();
+        if !self.options.share_enabled {
+            let _ = self.ensure_peer_control(
+                &username,
+                PeerMessage::UploadDenied {
+                    filename,
+                    reason: "File not shared.".to_string(),
+                },
+            );
+            return;
+        }
+
+        let Some(entry) = self.share.lookup(&filename).cloned() else {
+            let _ = self.ensure_peer_control(
+                &username,
+                PeerMessage::UploadDenied {
+                    filename,
+                    reason: "File not shared.".to_string(),
+                },
+            );
+            return;
+        };
+
+        let live_size = match fs::metadata(&entry.local_path) {
+            Ok(m) if m.is_file() => m.len(),
+            _ => {
+                let _ = self.ensure_peer_control(
+                    &username,
+                    PeerMessage::UploadDenied {
+                        filename,
+                        reason: "File read error.".to_string(),
+                    },
+                );
+                return;
+            }
+        };
+
+        // Deduplicate if this peer already has this exact file queued or transferring
+        if let Some(existing_place) = self.upload_queue_place(&username, &filename) {
+            let _ = self.ensure_peer_control(
+                &username,
+                PeerMessage::PlaceInQueueResponse {
+                    filename,
+                    place: existing_place,
+                },
+            );
+            return;
+        }
+        if self
+            .uploads
+            .iter()
+            .any(|u| u.username == username && paths_match(&u.virtual_path, &filename))
+        {
+            return;
+        }
+
+        if self.queued_upload_count() >= DEFAULT_UPLOAD_QUEUE_CAP {
+            let _ = self.ensure_peer_control(
+                &username,
+                PeerMessage::UploadDenied {
+                    filename,
+                    reason: "Too many files".to_string(),
+                },
+            );
+            return;
+        }
+
+        let id = self.next_upload_id;
+        self.next_upload_id += 1;
+
+        self.log(
+            LogLevel::Info,
+            "upload_queued",
+            format!(
+                "peer {} queued upload of {}",
+                username,
+                redacted_basename(&entry.virtual_path)
+            ),
+        );
+
+        self.uploads.push(ActiveUpload {
+            id,
+            username: username.clone(),
+            virtual_path: filename.clone(),
+            local_path: entry.local_path,
+            file_size: live_size,
+            transfer_token: None,
+            connect_token: None,
+            state: UploadSocketState::Queued,
+            in_flight_socket: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: None,
+        });
+
+        self.pump_upload_slots();
+
+        if let Some(place) = self.upload_queue_place(&username, &filename) {
+            let _ = self.ensure_peer_control(
+                &username,
+                PeerMessage::PlaceInQueueResponse { filename, place },
+            );
+        }
+    }
+
+    fn pump_upload_slots(&mut self) {
+        let max_slots = if self.options.share_enabled {
+            DEFAULT_UPLOAD_SLOTS as usize
+        } else {
+            0
+        };
+        while self.active_upload_slots_used() < max_slots {
+            let Some(idx) = self
+                .uploads
+                .iter()
+                .position(|u| matches!(u.state, UploadSocketState::Queued))
+            else {
+                break;
+            };
+            let token = next_token();
+            let now = Instant::now();
+            self.uploads[idx].transfer_token = Some(token);
+            self.uploads[idx].state =
+                UploadSocketState::WaitingTransferResponse { offered_at: now };
+            let username = self.uploads[idx].username.clone();
+            let filename = self.uploads[idx].virtual_path.clone();
+            let file_size = self.uploads[idx].file_size;
+
+            if self
+                .ensure_peer_control(
+                    &username,
+                    PeerMessage::TransferRequest {
+                        direction: 1,
+                        token,
+                        filename: filename.clone(),
+                        file_size: Some(file_size),
+                    },
+                )
+                .is_err()
+            {
+                self.uploads.remove(idx);
+            }
+        }
+    }
+
+    fn handle_upload_transfer_response(
+        &mut self,
+        username: &str,
+        token: u32,
+        allowed: bool,
+        reason: Option<String>,
+    ) {
+        let Some(idx) = self.uploads.iter().position(|u| {
+            u.transfer_token == Some(token)
+                && u.username == username
+                && matches!(u.state, UploadSocketState::WaitingTransferResponse { .. })
+        }) else {
+            return;
+        };
+
+        if !allowed {
+            let removed = self.uploads.remove(idx);
+            self.log(
+                LogLevel::Debug,
+                "upload_rejected_by_peer",
+                format!(
+                    "peer {} declined upload offer for {} ({})",
+                    removed.username,
+                    redacted_basename(&removed.virtual_path),
+                    reason.unwrap_or_else(|| "declined".to_string())
+                ),
+            );
+            self.pump_upload_slots();
+            return;
+        }
+
+        let connect_token = next_token();
+        self.uploads[idx].connect_token = Some(connect_token);
+        self.uploads[idx].state = UploadSocketState::Connecting {
+            started_at: Instant::now(),
+        };
+        let peer_user = self.uploads[idx].username.clone();
+
+        // Initiate F connection using modern dual-path order: ConnectToPeer("F") + GetPeerAddress.
+        let _ = self.send_server(&ServerRequest::ConnectToPeer {
+            token: connect_token,
+            username: peer_user.clone(),
+            conn_type: ConnectionType::File,
+        });
+        let _ = self.send_server(&ServerRequest::GetPeerAddress {
+            username: peer_user,
+        });
+    }
+
+    fn dial_pending_uploads_direct(&self, username: &str, ip: Ipv4Addr, port: u32) {
+        if ip.is_unspecified() || port == 0 || port > 65535 {
+            return;
+        }
+        let Some(own_user) = self.creds.as_ref().map(|c| c.username.clone()) else {
+            return;
+        };
+        let host = ip.to_string();
+        for up in &self.uploads {
+            if up.username == username
+                && matches!(up.state, UploadSocketState::Connecting { .. })
+                && up.in_flight_socket.is_none()
+                && let Some(transfer_token) = up.transfer_token
+            {
+                let upload_id = up.id;
+                let host_clone = host.clone();
+                let own_clone = own_user.clone();
+                let tx = self.event_tx.clone();
+                let _ = thread::Builder::new()
+                    .name("slsk-dial-f".to_string())
+                    .spawn(move || {
+                        if let Ok(stream) =
+                            dial_direct_upload_socket(&host_clone, port, &own_clone, transfer_token)
+                        {
+                            let _ = tx.send(WorkerEvent::UploadSocketConnected {
+                                upload_id,
+                                stream,
+                                buffered: Vec::new(),
+                            });
+                        }
+                    });
+            }
+        }
+    }
+
+    fn start_matched_file_upload(&mut self, upload_id: u64, stream: TcpStream, buffered: Vec<u8>) {
+        let Some(up) = self.uploads.iter_mut().find(|u| u.id == upload_id) else {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        };
+        if up.in_flight_socket.is_some() {
+            // Another path (direct vs pierced) already connected first; close duplicate cleanly.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
+        up.state = UploadSocketState::Transferring;
+        if let Ok(ctrl) = stream.try_clone() {
+            up.in_flight_socket = Some(Arc::new(Mutex::new(ctrl)));
+        }
+        let local_path = up.local_path.clone();
+        let cancel = Arc::clone(&up.cancel);
+        let progress = up.progress.clone();
+        let tx = self.event_tx.clone();
+
+        let _ = thread::Builder::new()
+            .name("slsk-file-tx".to_string())
+            .spawn(move || {
+                let result =
+                    stream_file_upload(stream, &buffered, local_path, &cancel, progress.as_ref());
+                let _ = tx.send(WorkerEvent::UploadFinished { upload_id, result });
+            });
+    }
+
+    fn finish_upload(&mut self, upload_id: u64, result: Result<UploadOutcome, TransferError>) {
+        let Some(idx) = self.uploads.iter().position(|u| u.id == upload_id) else {
+            return;
+        };
+        let up = self.uploads.remove(idx);
+        match result {
+            Ok(outcome) => {
+                if outcome.speed_bytes_per_sec > 0 {
+                    self.last_upload_speed = outcome.speed_bytes_per_sec;
+                    let _ = self.send_server(&ServerRequest::SendUploadSpeed {
+                        speed: outcome.speed_bytes_per_sec,
+                    });
+                }
+                self.log(
+                    LogLevel::Info,
+                    "upload_complete",
+                    format!(
+                        "uploaded {} to {} ({} bytes, offset={})",
+                        redacted_basename(&up.virtual_path),
+                        up.username,
+                        outcome.bytes_sent,
+                        outcome.start_offset
+                    ),
+                );
+            }
+            Err(e) => {
+                self.log(
+                    LogLevel::Warn,
+                    "upload_failed_local",
+                    format!(
+                        "upload of {} to {} failed: {e}",
+                        redacted_basename(&up.virtual_path),
+                        up.username
+                    ),
+                );
+                let _ = self.ensure_peer_control(
+                    &up.username,
+                    PeerMessage::UploadFailed {
+                        filename: up.virtual_path,
+                    },
+                );
+            }
+        }
+        self.pump_upload_slots();
+    }
+}
+
+fn default_share_enabled_from_env() -> bool {
+    match std::env::var("PEARTUBE_SLSK_SHARE") {
+        Ok(raw) => {
+            let v = raw.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
+}
+
+fn json_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use fmt::Write as _;
+                let _ = write!(&mut out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Format the startup/reconfigure share decision JSON line matching the relay's staging log shape:
+/// - disabled: `{"msg":"soulseek share","enabled":false,"files":0}` (omits `dir` so private paths stay unlogged)
+/// - enabled:  `{"msg":"soulseek share","enabled":true,"files":N,"dir":"..."}`
+#[must_use]
+pub fn format_share_decision_json(options: &ClientOptions, files: u32) -> String {
+    if !options.share_enabled {
+        return r#"{"msg":"soulseek share","enabled":false,"files":0}"#.to_string();
+    }
+    match options.share_dir.as_ref() {
+        Some(dir) => {
+            let escaped = json_escape(&dir.to_string_lossy());
+            format!(
+                r#"{{"msg":"soulseek share","enabled":true,"files":{files},"dir":"{escaped}"}}"#
+            )
+        }
+        None => format!(r#"{{"msg":"soulseek share","enabled":true,"files":{files},"dir":null}}"#),
+    }
+}
+
+fn default_share_max_files_from_env() -> usize {
+    std::env::var("PEARTUBE_SLSK_SHARE_MAX_FILES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SHARE_MAX_FILES)
+}
+
+fn default_share_dir_from_env() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("PEARTUBE_SLSK_SHARE_DIR")
+        && !explicit.is_empty()
+    {
+        return Some(PathBuf::from(explicit));
+    }
+    if let Some(watch) = std::env::var_os("PEARTUBE_WATCH_DIR")
+        && !watch.is_empty()
+    {
+        return Some(PathBuf::from(watch));
+    }
+    if let Some(storage) = std::env::var_os("PEARTUBE_STORAGE")
+        && !storage.is_empty()
+    {
+        return Some(PathBuf::from(storage).join("staging"));
+    }
+    None
+}
+
+fn normalize_virtual_key(path: &str) -> String {
+    path.replace('/', "\\").to_ascii_lowercase()
+}
+
+fn is_shareable_media_name(name: &str) -> bool {
+    if name.starts_with('.') || name.starts_with('@') {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".part") || lower.ends_with(".json") || lower.ends_with(".tmp") {
+        return false;
+    }
+    let Some((_, ext)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext,
+        "flac"
+            | "mp3"
+            | "ogg"
+            | "opus"
+            | "wav"
+            | "aac"
+            | "m4a"
+            | "alac"
+            | "aiff"
+            | "aif"
+            | "wv"
+            | "ape"
+            | "mp4"
+            | "m4v"
+            | "mkv"
+            | "webm"
+            | "avi"
+            | "mov"
+            | "ts"
+            | "m2ts"
+            | "mts"
+            | "mpg"
+            | "mpeg"
+            | "ogv"
+    )
+}
+
+/// Probe lightweight audio attributes (FLAC `STREAMINFO` sample rate, bit depth, and duration)
+/// from the first 128 bytes of a file without decoding audio frames.
+fn probe_audio_attributes(path: &Path, file_size: u64) -> AudioAttributes {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "flac"
+        && let Ok(mut f) = File::open(path)
+    {
+        let mut head = [0u8; 42];
+        if f.read_exact(&mut head).is_ok() && &head[0..4] == b"fLaC" && (head[4] & 0x7f) == 0 {
+            // FLAC STREAMINFO block (34 bytes starting at offset 8):
+            // bytes 18..26 (offset 8 + 10 = 18):
+            // [20 bits sample_rate][3 bits channels-1][5 bits bps-1][36 bits total_samples]
+            let b = &head[18..26];
+            let sr = (u32::from(b[0]) << 12) | (u32::from(b[1]) << 4) | (u32::from(b[2]) >> 4);
+            let bps = (((u32::from(b[2]) & 0x01) << 4) | (u32::from(b[3]) >> 4)) + 1;
+            let total_samples = ((u64::from(b[3]) & 0x0f) << 32)
+                | (u64::from(b[4]) << 24)
+                | (u64::from(b[5]) << 16)
+                | (u64::from(b[6]) << 8)
+                | u64::from(b[7]);
+            let length_secs = if sr > 0 && total_samples > 0 {
+                Some((total_samples / u64::from(sr)) as u32)
+            } else {
+                None
+            };
+            if sr > 0 {
+                return AudioAttributes {
+                    bitrate: None,
+                    length_secs,
+                    vbr: None,
+                    sample_rate: Some(sr),
+                    bit_depth: Some(bps),
+                };
+            }
+        }
+    }
+    let _ = file_size;
+    AudioAttributes::default()
+}
+
+/// Scan the configured share directory (one-level album subdirectories plus top-level media files,
+/// skipping symlinks, hidden/dot files, `@eaDir`, and `.part` files) up to `options.share_max_files`.
+fn scan_share_snapshot(options: &ClientOptions) -> ShareSnapshot {
+    if !options.share_enabled || options.share_max_files == 0 {
+        return ShareSnapshot::default();
+    }
+    let Some(root) = options.share_dir.as_ref() else {
+        return ShareSnapshot::default();
+    };
+    let Ok(read_root) = fs::read_dir(root) else {
+        return ShareSnapshot::default();
+    };
+
+    let mut top_entries: Vec<_> = read_root.filter_map(Result::ok).collect();
+    top_entries.sort_by_key(|e| e.file_name());
+
+    let cap = options.share_max_files;
+    let mut folders = Vec::new();
+    let mut files = Vec::new();
+    let mut by_key = HashMap::new();
+    let mut root_wire_files = Vec::new();
+
+    for entry in top_entries {
+        if files.len() >= cap {
+            break;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let raw_name = entry.file_name();
+        let Some(name) = raw_name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') || name.starts_with('@') {
+            continue;
+        }
+        let full_path = entry.path();
+        if ft.is_dir() {
+            let Ok(kids_iter) = fs::read_dir(&full_path) else {
+                continue;
+            };
+            let mut kids: Vec<_> = kids_iter.filter_map(Result::ok).collect();
+            kids.sort_by_key(|e| e.file_name());
+            let clean_dir = name.replace(['\\', '/'], "_");
+            let folder_vpath = format!("{SHARE_VIRTUAL_ROOT}\\{clean_dir}");
+            let mut wire_files = Vec::new();
+
+            for kid in kids {
+                if files.len() >= cap {
+                    break;
+                }
+                let Ok(kft) = kid.file_type() else {
+                    continue;
+                };
+                if kft.is_symlink() || !kft.is_file() {
+                    continue;
+                }
+                let kname_os = kid.file_name();
+                let Some(kname) = kname_os.to_str() else {
+                    continue;
+                };
+                if !is_shareable_media_name(kname) {
+                    continue;
+                }
+                let kpath = kid.path();
+                let Ok(meta) = fs::metadata(&kpath) else {
+                    continue;
+                };
+                if !meta.is_file() || meta.len() == 0 {
+                    continue;
+                }
+                let size = meta.len();
+                let attrs = probe_audio_attributes(&kpath, size);
+                let clean_leaf = kname.replace(['\\', '/'], "_");
+                let vpath = format!("{folder_vpath}\\{clean_leaf}");
+                let idx = files.len();
+                by_key.insert(normalize_virtual_key(&vpath), idx);
+                files.push(SharedLocalFile {
+                    search_haystack: vpath.to_ascii_lowercase(),
+                    virtual_path: vpath,
+                    local_path: kpath,
+                    size,
+                    attrs: attrs.clone(),
+                });
+                wire_files.push(WireFileEntry {
+                    filename: clean_leaf,
+                    size,
+                    extension: String::new(),
+                    attrs,
+                });
+            }
+
+            if !wire_files.is_empty() {
+                folders.push(SharedFolder {
+                    path: folder_vpath,
+                    files: wire_files,
+                });
+            }
+        } else if ft.is_file() && is_shareable_media_name(name) {
+            let Ok(meta) = fs::metadata(&full_path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() == 0 {
+                continue;
+            }
+            let size = meta.len();
+            let attrs = probe_audio_attributes(&full_path, size);
+            let clean_leaf = name.replace(['\\', '/'], "_");
+            let vpath = format!("{SHARE_VIRTUAL_ROOT}\\{clean_leaf}");
+            let idx = files.len();
+            by_key.insert(normalize_virtual_key(&vpath), idx);
+            files.push(SharedLocalFile {
+                search_haystack: vpath.to_ascii_lowercase(),
+                virtual_path: vpath,
+                local_path: full_path,
+                size,
+                attrs: attrs.clone(),
+            });
+            root_wire_files.push(WireFileEntry {
+                filename: clean_leaf,
+                size,
+                extension: String::new(),
+                attrs,
+            });
+        }
+    }
+
+    if !root_wire_files.is_empty() {
+        folders.insert(
+            0,
+            SharedFolder {
+                path: SHARE_VIRTUAL_ROOT.to_string(),
+                files: root_wire_files,
+            },
+        );
+    }
+
+    ShareSnapshot {
+        folders,
+        files,
+        by_key,
     }
 }
 

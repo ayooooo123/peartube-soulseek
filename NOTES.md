@@ -20,8 +20,8 @@ Grounded in Nicotine+ (`pynicotine/slskmessages.py`) and `SLSKPROTOCOL.md`.
 | `26` | `FileSearch` | Send & Recv | Full | Dispatches network search queries by 32-bit correlation token; decodes incoming server-forwarded search frames. |
 | `28` | `SetStatus` | Send | Full | Sets client status (`2 = Online`) post-login. |
 | `32` | `ServerPing` | Send | Full | Sent every 45s to keep NAT/TCP session alive. |
-| `35` | `SharedFoldersFiles` | Send | Full | Reports `(0, 0)` shared counts post-login. |
-| `36` | `GetUserStats` | Send & Recv | Codec | Encodes/decodes peer upload speed and file/folder counts. |
+| `35` | `SharedFoldersFiles` | Send | Full | Reports `(0, 0)` when sharing is disabled (default) or `(folders, files)` from the scanned album share when `PEARTUBE_SLSK_SHARE=1`. |
+| `36` | `GetUserStats` | Send & Recv | Full | Queries and decodes peer/own upload speed and server-recorded shared file/folder counts. |
 | `41` | `Relogged` | Recv | Full | Marks session replaced by another login and suppresses auto-reconnect loop. |
 | `66` | `AdminMessage` | Recv | Codec | Decodes server broadcast string. |
 | `69` | `PrivilegedUsers` | Recv | Codec | Decodes privileged username list. |
@@ -33,6 +33,7 @@ Grounded in Nicotine+ (`pynicotine/slskmessages.py`) and `SLSKPROTOCOL.md`.
 | `100` | `AcceptChildren` | Send | Full | Sends `false` on login so relay does not absorb distributed child traffic. |
 | `102` | `PossibleParents` | Recv | Codec | Decodes candidate parent list `(username, ipv4, port)`. |
 | `104` | `WishlistInterval` | Recv | Codec | Decodes server-dictated wishlist interval. |
+| `121` | `SendUploadSpeed` | Send | Full | Reports measured upload throughput (`bytes/sec`) after a completed upload. |
 | `126` | `BranchLevel` | Send | Codec | Encodes distributed branch level. |
 | `127` | `BranchRoot` | Send | Codec | Encodes distributed branch root username. |
 | `130` | `ResetDistributed` | Recv | Codec | Decodes distributed topology reset. |
@@ -50,20 +51,20 @@ Grounded in Nicotine+ (`pynicotine/slskmessages.py`) and `SLSKPROTOCOL.md`.
 
 | Code | Name | Direction | Status | Notes |
 | ---: | :--- | :--- | :--- | :--- |
-| `4` | `SharedFileListRequest` | Send & Recv | Full | Requests peer share listing; answers inbound requests with an empty list. |
+| `4` | `SharedFileListRequest` | Send & Recv | Full | Requests peer share listing; answers inbound requests with the advertised `@@peartube\...` folder tree (or empty when sharing is off). |
 | `5` | `SharedFileListResponse` | Send & Recv | Full | Zlib-compressed public + optional private folder/file trees. |
-| `9` | `FileSearchResponse` | Send & Recv | Full | Zlib-compressed search hit list, audio attributes (`0,1,2,4,5`), slot availability, upload speed, and queue length. |
-| `15` | `UserInfoRequest` | Send & Recv | Full | Queries peer slot/queue status during `browse()`; answers inbound requests politely. |
+| `9` | `FileSearchResponse` | Send & Recv | Full | Zlib-compressed search hit list, audio attributes (`0,1,2,4,5`), slot availability, upload speed, and queue length; also answers inbound `FileSearch` hits when sharing is enabled. |
+| `15` | `UserInfoRequest` | Send & Recv | Full | Queries peer slot/queue status during `browse()`; answers inbound requests honestly (`upload_slots: 0, slot_free: false` when sharing is off; real slot/queue counts when sharing is on). |
 | `16` | `UserInfoResponse` | Send & Recv | Full | Parses description, optional picture bytes, upload slots, queue length, free-slot flag, and optional permission code. |
-| `36` | `FolderContentsRequest` | Send & Recv | Codec | Single-folder listing request codec. |
-| `37` | `FolderContentsResponse` | Send & Recv | Codec | Zlib-compressed single-folder listing response codec. |
-| `40` | `TransferRequest` | Send & Recv | Full | Handles incoming `direction = 1` upload offers from peer; politely rejects `direction = 0` download requests (`"File not shared."`). |
-| `41` | `TransferResponse` | Send & Recv | Full | Accepts matched transfer tickets (`allowed = true`) or rejects unknown/cancelled ones. |
-| `43` | `QueueUpload` | Send & Recv | Full | Enqueues file download on remote peer. |
-| `44` | `PlaceInQueueResponse` | Send & Recv | Full | Updates live queue placement and invokes the progress callback (`TransferPhase::Queued`). |
-| `46` | `UploadFailed` | Send & Recv | Full | Fails waiting download cleanly when peer cannot read/upload file. |
-| `50` | `UploadDenied` | Send & Recv | Full | Fails download immediately with peer's rejection reason (`File not shared.`, `Banned`, `Too many files`, etc.). |
-| `51` | `PlaceInQueueRequest` | Send & Recv | Full | Sent after `QueueUpload` and polled every 30s while queued. |
+| `36` | `FolderContentsRequest` | Send & Recv | Full | Answers single-folder content requests against the advertised share tree. |
+| `37` | `FolderContentsResponse` | Send & Recv | Full | Zlib-compressed single-folder listing response. |
+| `40` | `TransferRequest` | Send & Recv | Full | Handles incoming `direction = 1` upload offers for our downloads, sends `direction = 1` offers for queued peer uploads, and queues legacy `direction = 0` requests (`"Queued"` when shared, `"File not shared."` otherwise). |
+| `41` | `TransferResponse` | Send & Recv | Full | Accepts matched download tickets and handles peer responses to our upload offers before opening `F` sockets. |
+| `43` | `QueueUpload` | Send & Recv | Full | Enqueues file download on remote peer; accepts inbound peer upload requests into a bounded 32-entry queue across 2 upload slots. |
+| `44` | `PlaceInQueueResponse` | Send & Recv | Full | Updates live download queue placement and answers inbound `PlaceInQueueRequest` / queued `QueueUpload` positions. |
+| `46` | `UploadFailed` | Send & Recv | Full | Fails waiting download cleanly when peer cannot upload; notifies peer if local upload fails. |
+| `50` | `UploadDenied` | Send & Recv | Full | Fails download with peer's rejection reason; rejects unshared (`"File not shared."`), unreadable (`"File read error."`), or over-capacity (`"Too many files"`) upload requests. |
+| `51` | `PlaceInQueueRequest` | Send & Recv | Full | Sent after `QueueUpload` and polled every 30s while queued; answered for peers queued on our uploader. |
 
 ### File Connection (`F` socket, unframed)
 
@@ -89,7 +90,7 @@ Grounded in Nicotine+ (`pynicotine/slskmessages.py`) and `SLSKPROTOCOL.md`.
 1. **Chat rooms & room moderation (out of v1 scope):**
    `SayChatroom` (13), `JoinRoom` (14), `LeaveRoom` (15), `UserJoinedRoom` (16), `UserLeftRoom` (17), `RoomList` (64), `RoomTickers` (113), `RoomTickerAdded` (114), `RoomTickerRemoved` (115), `SetRoomTicker` (116), `RoomSearch` (120), `RoomMembers` (133), `AddRoomMember` (134), `RemoveRoomMember` (135), `CancelRoomMembership` (136), `CancelRoomOwnership` (137), `RoomMembershipGranted` (139), `RoomMembershipRevoked` (140), `EnableRoomInvitations` (141), `AddRoomOperator` (143), `RemoveRoomOperator` (144), `RoomOperatorshipGranted` (145), `RoomOperatorshipRevoked` (146), `RoomOperators` (148), `JoinGlobalRoom` (150), `LeaveGlobalRoom` (151), `GlobalRoomMessage` (152), `CantCreateRoom` (1003). Unknown incoming server codes decode into `ServerResponse::Unknown { code, payload_len }` and are safely ignored without desynchronizing the stream.
 2. **Social / recommendations / account management (out of v1 scope):**
-   `UserSearch` (42), `AddThingILike` (51), `RemoveThingILike` (52), `Recommendations` (54), `GlobalRecommendations` (56), `UserInterests` (57), `WishlistSearch` (103), `SimilarUsers` (110), `ItemRecommendations` (111), `ItemSimilarUsers` (112), `AddThingIHate` (117), `RemoveThingIHate` (118), `SendUploadSpeed` (121), `GivePrivileges` (123), `ChangePassword` (142), `MessageUsers` (149).
+   `UserSearch` (42), `AddThingILike` (51), `RemoveThingILike` (52), `Recommendations` (54), `GlobalRecommendations` (56), `UserInterests` (57), `WishlistSearch` (103), `SimilarUsers` (110), `ItemRecommendations` (111), `ItemSimilarUsers` (112), `AddThingIHate` (117), `RemoveThingIHate` (118), `GivePrivileges` (123), `ChangePassword` (142), `MessageUsers` (149).
 3. **Obsolete / deprecated messages (deliberately omitted per `SLSKPROTOCOL`):**
    Server codes `11`, `12`, `25`, `33`, `34`, `40`, `50`, `55`, `58`, `59`, `60`, `62`, `63`, `65`, `67`, `68`, `73`, `86`, `87`, `88`, `90`, `91`, `122`, `124`, `125`, `129`, `138`, `153`; Peer codes `1`, `8`, `10`, `14`, `33`, `34`, `42`, `47`, `48`, `49`, `52`; Distributed code `7`.
 
