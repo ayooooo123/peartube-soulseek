@@ -5,7 +5,7 @@
 //! - Credentials (`password`) are never logged at any level and never auto-generated.
 //! - Remote/local full paths are redacted to leaf basenames at `info`/`warn`/`error`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -28,6 +28,7 @@ use crate::transfer::{
 use parking_lot::{Mutex, RwLock};
 
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(45);
+const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -72,6 +73,28 @@ pub struct ClientState {
     pub logged_in: bool,
     pub privileges: u32,
     pub listen_port: u16,
+}
+
+/// Options for configuring background server keepalive, read liveness, and reconnect intervals.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientOptions {
+    pub listen_port: u16,
+    pub ping_interval: Duration,
+    pub server_read_timeout: Duration,
+    pub reconnect_backoff_min: Duration,
+    pub reconnect_backoff_max: Duration,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            listen_port: 0,
+            ping_interval: SERVER_PING_INTERVAL,
+            server_read_timeout: SERVER_READ_TIMEOUT,
+            reconnect_backoff_min: RECONNECT_BACKOFF_MIN,
+            reconnect_backoff_max: RECONNECT_BACKOFF_MAX,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +147,7 @@ struct Credentials {
 }
 
 struct ActiveSearch {
+    query: String,
     results: Vec<SharedFileRecord>,
     deadline: Instant,
     reply: Option<Sender<Result<Vec<SharedFileRecord>, ClientError>>>,
@@ -148,7 +172,7 @@ struct ActiveDownload {
     expected_size: Option<u64>,
     transfer_token: Option<u32>,
     queue_place: Option<u32>,
-    in_flight_socket: bool,
+    in_flight_socket: Option<Arc<Mutex<TcpStream>>>,
     last_queue_poll: Instant,
     cancel: Arc<AtomicBool>,
     progress: Option<ProgressCallback>,
@@ -185,6 +209,7 @@ enum WorkerCmd {
 enum WorkerEvent {
     Cmd(WorkerCmd),
     PeerControlConnected {
+        session_epoch: Option<u64>,
         conn_id: u64,
         username: String,
         writer: Arc<Mutex<TcpStream>>,
@@ -209,6 +234,7 @@ enum WorkerEvent {
         buffered: Vec<u8>,
     },
     PeerDialFailed {
+        session_epoch: u64,
         username: String,
         connect_token: Option<u32>,
         reason: String,
@@ -256,6 +282,16 @@ impl SoulseekClient {
     /// Create a client binding TCP peer listener on `listen_port` (`0` = OS-assigned port).
     #[must_use]
     pub fn with_listen_port(listen_port: u16) -> Self {
+        Self::with_options(ClientOptions {
+            listen_port,
+            ..ClientOptions::default()
+        })
+    }
+
+    /// Create a client with custom keepalive, server read timeout, and reconnect backoff options.
+    #[must_use]
+    pub fn with_options(options: ClientOptions) -> Self {
+        let listen_port = options.listen_port;
         let logger: Arc<RwLock<Option<LoggerHook>>> = Arc::new(RwLock::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -299,7 +335,10 @@ impl SoulseekClient {
             .name("slsk-worker".to_string())
             .spawn(move || {
                 let mut engine = WorkerEngine::new(
-                    bound_port,
+                    ClientOptions {
+                        listen_port: bound_port,
+                        ..options
+                    },
                     event_tx,
                     state_worker,
                     logger_worker,
@@ -511,16 +550,17 @@ struct WorkerEngine {
     logger: Arc<RwLock<Option<LoggerHook>>>,
     shutdown: Arc<AtomicBool>,
 
-    listen_port: u16,
+    options: ClientOptions,
     creds: Option<Credentials>,
     relogged_out: bool,
 
+    session_epoch: u64,
     server_stream: Option<TcpStream>,
     server_decoder: FrameDecoder,
     last_ping: Instant,
+    last_server_rx: Instant,
     reconnect_at: Option<Instant>,
     reconnect_backoff: Duration,
-
     peers: HashMap<String, (u64, Arc<Mutex<TcpStream>>)>,
     pending_peer_msgs: HashMap<String, Vec<PeerMessage>>,
     pending_connect_tokens: HashMap<u32, (String, Instant)>,
@@ -533,25 +573,28 @@ struct WorkerEngine {
 
 impl WorkerEngine {
     fn new(
-        bound_port: u16,
+        options: ClientOptions,
         event_tx: Sender<WorkerEvent>,
         state: Arc<RwLock<ClientState>>,
         logger: Arc<RwLock<Option<LoggerHook>>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
+        let now = Instant::now();
         Self {
             event_tx,
             state,
             logger,
             shutdown,
-            listen_port: bound_port,
+            reconnect_backoff: options.reconnect_backoff_min,
+            options,
             creds: None,
             relogged_out: false,
+            session_epoch: 0,
             server_stream: None,
             server_decoder: FrameDecoder::new(),
-            last_ping: Instant::now(),
+            last_ping: now,
+            last_server_rx: now,
             reconnect_at: None,
-            reconnect_backoff: RECONNECT_BACKOFF_MIN,
             peers: HashMap::new(),
             pending_peer_msgs: HashMap::new(),
             pending_connect_tokens: HashMap::new(),
@@ -669,7 +712,7 @@ impl WorkerEngine {
                 conn_type: ConnectionType::Peer,
                 ..
             } => {
-                Self::spawn_peer_reader(username, stream, decoder, event_tx, logger);
+                Self::spawn_peer_reader(None, username, stream, decoder, event_tx, logger);
             }
             PeerInitMessage::PeerInit {
                 username,
@@ -715,6 +758,7 @@ impl WorkerEngine {
     }
 
     fn spawn_peer_reader(
+        session_epoch: Option<u64>,
         username: String,
         stream: TcpStream,
         mut decoder: FrameDecoder,
@@ -731,6 +775,7 @@ impl WorkerEngine {
 
         if event_tx
             .send(WorkerEvent::PeerControlConnected {
+                session_epoch,
                 conn_id,
                 username: username.clone(),
                 writer,
@@ -789,17 +834,41 @@ impl WorkerEngine {
         }
 
         self.disconnect_server();
+        self.abort_session_peer_work("client shutting down");
+    }
+
+    fn abort_session_peer_work(&mut self, reason: &str) {
+        self.pending_connect_tokens.clear();
+        self.pending_peer_msgs.clear();
         for (_, (_, writer)) in self.peers.drain() {
             let _ = writer.lock().shutdown(std::net::Shutdown::Both);
+        }
+        for (_, mut browse) in self.browses.drain() {
+            if let Some(reply) = browse.reply.take() {
+                let _ = reply.send(Err(ClientError::Disconnected(reason.to_owned())));
+            }
+        }
+        for mut dl in self.downloads.drain(..) {
+            if let Some(sock) = dl.in_flight_socket.take() {
+                let _ = sock.lock().shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(reply) = dl.reply.take() {
+                let _ = reply.send(Err(ClientError::Disconnected(reason.to_owned())));
+            }
         }
     }
 
     fn disconnect_server(&mut self) {
+        let had_session = self.server_stream.is_some();
         if let Some(s) = self.server_stream.take() {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
         self.server_decoder = FrameDecoder::new();
         self.update_state(false, false, None);
+        if had_session {
+            self.session_epoch = self.session_epoch.wrapping_add(1);
+            self.abort_session_peer_work("server session disconnected");
+        }
     }
 
     fn send_server(&mut self, req: &ServerRequest) -> Result<(), ClientError> {
@@ -823,7 +892,8 @@ impl WorkerEngine {
         self.disconnect_server();
         if self.creds.is_some() && !self.relogged_out {
             self.reconnect_at = Some(Instant::now() + self.reconnect_backoff);
-            self.reconnect_backoff = (self.reconnect_backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            self.reconnect_backoff =
+                (self.reconnect_backoff * 2).min(self.options.reconnect_backoff_max);
         }
     }
 
@@ -918,20 +988,26 @@ impl WorkerEngine {
             }
             ServerResponse::LoginSuccess { is_supporter, .. } => {
                 stream
+                    .set_read_timeout(Some(self.options.server_read_timeout))
+                    .map_err(|e| ClientError::Io(e.to_string()))?;
+                stream
                     .set_nonblocking(true)
                     .map_err(|e| ClientError::Io(e.to_string()))?;
+                let now = Instant::now();
+                self.session_epoch = self.session_epoch.wrapping_add(1);
                 self.server_stream = Some(stream);
                 self.server_decoder = decoder;
-                self.last_ping = Instant::now();
+                self.last_ping = now;
+                self.last_server_rx = now;
                 self.reconnect_at = None;
-                self.reconnect_backoff = RECONNECT_BACKOFF_MIN;
+                self.reconnect_backoff = self.options.reconnect_backoff_min;
                 self.relogged_out = false;
                 self.update_state(true, true, Some(u32::from(is_supporter)));
 
                 // Post-login initialization messages expected by Soulseek servers:
-                if self.listen_port > 0 {
+                if self.options.listen_port > 0 {
                     let _ = self.send_server(&ServerRequest::SetWaitPort {
-                        port: u32::from(self.listen_port),
+                        port: u32::from(self.options.listen_port),
                     });
                 }
                 let _ = self.send_server(&ServerRequest::SharedFoldersFiles {
@@ -951,7 +1027,7 @@ impl WorkerEngine {
                     "logged_in",
                     format!(
                         "logged in as {} (listen_port={})",
-                        creds.username, self.listen_port
+                        creds.username, self.options.listen_port
                     ),
                 );
                 Ok(self.state.read().clone())
@@ -971,6 +1047,8 @@ impl WorkerEngine {
     fn poll_server_socket(&mut self) {
         let mut scratch = [0u8; 16 * 1024];
         let mut disconnected = false;
+        let mut read_timed_out = false;
+        let now = Instant::now();
         if let Some(stream) = self.server_stream.as_mut() {
             loop {
                 match stream.read(&mut scratch) {
@@ -978,8 +1056,23 @@ impl WorkerEngine {
                         disconnected = true;
                         break;
                     }
-                    Ok(n) => self.server_decoder.push(&scratch[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Ok(n) => {
+                        self.last_server_rx = Instant::now();
+                        self.server_decoder.push(&scratch[..n]);
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if now.duration_since(self.last_server_rx)
+                            >= self.options.server_read_timeout
+                        {
+                            read_timed_out = true;
+                        }
+                        break;
+                    }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Err(_) => {
                         disconnected = true;
@@ -991,7 +1084,17 @@ impl WorkerEngine {
 
         self.drain_buffered_server_frames();
 
-        if disconnected {
+        if read_timed_out {
+            self.log(
+                LogLevel::Warn,
+                "server_read_timeout",
+                format!(
+                    "server socket read timed out after {:?}",
+                    self.options.server_read_timeout
+                ),
+            );
+            self.schedule_reconnect();
+        } else if disconnected {
             self.log(
                 LogLevel::Warn,
                 "server_disconnected",
@@ -1112,6 +1215,7 @@ impl WorkerEngine {
         let Some(own_user) = self.creds.as_ref().map(|c| c.username.clone()) else {
             return;
         };
+        let epoch = self.session_epoch;
         let tx = self.event_tx.clone();
         let log = Arc::clone(&self.logger);
 
@@ -1136,13 +1240,27 @@ impl WorkerEngine {
                 {
                     return;
                 }
-                Self::spawn_peer_reader(username, stream, FrameDecoder::new(), tx, log);
+                Self::spawn_peer_reader(
+                    Some(epoch),
+                    username,
+                    stream,
+                    FrameDecoder::new(),
+                    tx,
+                    log,
+                );
             });
     }
 
     fn dial_peer_pierce_p(&self, username: String, ip: Ipv4Addr, port: u32, token: u32) {
+        let epoch = self.session_epoch;
         if ip.is_unspecified() || port == 0 || port > 65535 {
-            tx_cant_connect(&self.event_tx, username, token, "invalid peer address");
+            tx_cant_connect(
+                &self.event_tx,
+                epoch,
+                username,
+                token,
+                "invalid peer address",
+            );
             return;
         }
         let tx = self.event_tx.clone();
@@ -1155,23 +1273,37 @@ impl WorkerEngine {
                 let mut stream = match TcpStream::connect_timeout(&addr, PEER_DIAL_TIMEOUT) {
                     Ok(s) => s,
                     Err(e) => {
-                        tx_cant_connect(&tx, username, token, &e.to_string());
+                        tx_cant_connect(&tx, epoch, username, token, &e.to_string());
                         return;
                     }
                 };
                 let _ = stream.set_nodelay(true);
                 let pierce = PeerInitMessage::PierceFirewall { token }.encode();
                 if let Err(e) = stream.write_all(&pierce).and_then(|()| stream.flush()) {
-                    tx_cant_connect(&tx, username, token, &e.to_string());
+                    tx_cant_connect(&tx, epoch, username, token, &e.to_string());
                     return;
                 }
-                Self::spawn_peer_reader(username, stream, FrameDecoder::new(), tx, log);
+                Self::spawn_peer_reader(
+                    Some(epoch),
+                    username,
+                    stream,
+                    FrameDecoder::new(),
+                    tx,
+                    log,
+                );
             });
     }
 
     fn dial_peer_pierce_f(&self, username: String, ip: Ipv4Addr, port: u32, token: u32) {
+        let epoch = self.session_epoch;
         if ip.is_unspecified() || port == 0 || port > 65535 {
-            tx_cant_connect(&self.event_tx, username, token, "invalid F peer address");
+            tx_cant_connect(
+                &self.event_tx,
+                epoch,
+                username,
+                token,
+                "invalid F peer address",
+            );
             return;
         }
         let tx = self.event_tx.clone();
@@ -1188,7 +1320,7 @@ impl WorkerEngine {
                     });
                 }
                 Err(e) => {
-                    tx_cant_connect(&tx, username, token, &e.to_string());
+                    tx_cant_connect(&tx, epoch, username, token, &e.to_string());
                 }
             });
     }
@@ -1197,10 +1329,19 @@ impl WorkerEngine {
         match ev {
             WorkerEvent::Cmd(cmd) => self.handle_command(cmd),
             WorkerEvent::PeerControlConnected {
+                session_epoch,
                 conn_id,
                 username,
                 writer,
             } => {
+                if session_epoch.is_some_and(|ep| ep != self.session_epoch) {
+                    let _ = writer.lock().shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                if self.server_stream.is_none() && self.searches.is_empty() {
+                    let _ = writer.lock().shutdown(std::net::Shutdown::Both);
+                    return;
+                }
                 self.peers
                     .insert(username.clone(), (conn_id, Arc::clone(&writer)));
                 if let Some(queued) = self.pending_peer_msgs.remove(&username) {
@@ -1228,14 +1369,20 @@ impl WorkerEngine {
             } => {
                 if let Some((username, _)) = self.pending_connect_tokens.remove(&connect_token) {
                     Self::spawn_peer_reader(
+                        Some(self.session_epoch),
                         username,
                         stream,
                         decoder,
                         self.event_tx.clone(),
                         Arc::clone(&self.logger),
                     );
-                } else {
-                    // Otherwise treat as a pierced file socket carrying a 4-byte FileTransferInit ticket.
+                } else if self.server_stream.is_some()
+                    && self
+                        .downloads
+                        .iter()
+                        .any(|d| d.transfer_token.is_some() && d.in_flight_socket.is_none())
+                {
+                    // Treat as a pierced file socket carrying a 4-byte FileTransferInit ticket.
                     let tx = self.event_tx.clone();
                     let _ = thread::Builder::new()
                         .name("slsk-pierce-rx-f".to_string())
@@ -1259,6 +1406,8 @@ impl WorkerEngine {
                                 });
                             }
                         });
+                } else {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
             }
             WorkerEvent::IncomingFileSocket {
@@ -1267,9 +1416,14 @@ impl WorkerEngine {
                 stream,
                 buffered,
             } => {
+                if self.server_stream.is_none() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
                 self.start_matched_file_transfer(username, transfer_token, stream, buffered);
             }
             WorkerEvent::PeerDialFailed {
+                session_epoch,
                 username,
                 connect_token,
                 reason,
@@ -1279,7 +1433,9 @@ impl WorkerEngine {
                     "peer_dial_failed",
                     format!("peer dial to {username} failed: {reason}"),
                 );
-                if let Some(token) = connect_token {
+                if session_epoch == self.session_epoch
+                    && let Some(token) = connect_token
+                {
                     let _ = self.send_server(&ServerRequest::CantConnectToPeer { token, username });
                 }
             }
@@ -1307,23 +1463,38 @@ impl WorkerEngine {
                 reply,
             } => {
                 let token = next_token();
-                if let Err(e) = self.send_server(&ServerRequest::FileSearch {
-                    token,
-                    query: query.clone(),
-                }) {
-                    let _ = reply.send(Err(e));
+                let deadline = Instant::now() + timeout;
+                let dispatched = if self.server_stream.is_some() {
+                    match self.send_server(&ServerRequest::FileSearch {
+                        token,
+                        query: query.clone(),
+                    }) {
+                        Ok(()) => true,
+                        Err(_) if self.reconnect_at.is_some() => false,
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                            return;
+                        }
+                    }
+                } else if self.reconnect_at.is_some() && !self.relogged_out {
+                    false
+                } else {
+                    let _ = reply.send(Err(ClientError::NotLoggedIn));
                     return;
+                };
+                if dispatched {
+                    self.log(
+                        LogLevel::Info,
+                        "search_started",
+                        format!("search dispatched (token={token})"),
+                    );
                 }
-                self.log(
-                    LogLevel::Info,
-                    "search_started",
-                    format!("search dispatched (token={token})"),
-                );
                 self.searches.insert(
                     token,
                     ActiveSearch {
+                        query,
                         results: Vec::new(),
-                        deadline: Instant::now() + timeout,
+                        deadline,
                         reply: Some(reply),
                     },
                 );
@@ -1378,22 +1549,32 @@ impl WorkerEngine {
                     }
                 };
 
-                if let Err(e) = self.ensure_peer_control(
-                    &username,
-                    PeerMessage::QueueUpload {
-                        filename: filename.clone(),
-                    },
-                ) {
-                    let _ = reply.send(Err(e));
+                if self.server_stream.is_some() {
+                    let _ = self.send_server(&ServerRequest::WatchUser {
+                        username: username.clone(),
+                    });
+                    if let Err(e) = self.ensure_peer_control(
+                        &username,
+                        PeerMessage::QueueUpload {
+                            filename: filename.clone(),
+                        },
+                    ) {
+                        if self.reconnect_at.is_none() {
+                            let _ = reply.send(Err(e));
+                            return;
+                        }
+                    } else {
+                        let _ = self.ensure_peer_control(
+                            &username,
+                            PeerMessage::PlaceInQueueRequest {
+                                filename: filename.clone(),
+                            },
+                        );
+                    }
+                } else if self.reconnect_at.is_none() || self.relogged_out {
+                    let _ = reply.send(Err(ClientError::NotLoggedIn));
                     return;
                 }
-                let _ = self.ensure_peer_control(
-                    &username,
-                    PeerMessage::PlaceInQueueRequest {
-                        filename: filename.clone(),
-                    },
-                );
-
                 let id = self.next_download_id;
                 self.next_download_id += 1;
 
@@ -1421,7 +1602,7 @@ impl WorkerEngine {
                     expected_size: size_hint,
                     transfer_token: None,
                     queue_place: None,
-                    in_flight_socket: false,
+                    in_flight_socket: None,
                     last_queue_poll: Instant::now(),
                     cancel,
                     progress,
@@ -1527,10 +1708,9 @@ impl WorkerEngine {
                 // Peer is ready to upload to us! Match our queued download and send TransferResponse(allowed=true).
                 let matched = self.downloads.iter_mut().find(|dl| {
                     dl.username == username
-                        && !dl.in_flight_socket
+                        && dl.in_flight_socket.is_none()
                         && paths_match(&dl.remote_filename, &filename)
                 });
-
                 if let Some(dl) = matched {
                     dl.transfer_token = Some(token);
                     if let Some(sz) = file_size {
@@ -1610,7 +1790,7 @@ impl WorkerEngine {
             PeerMessage::UploadFailed { filename } => {
                 if let Some(idx) = self.downloads.iter().position(|dl| {
                     dl.username == username
-                        && !dl.in_flight_socket
+                        && dl.in_flight_socket.is_none()
                         && paths_match(&dl.remote_filename, &filename)
                 }) {
                     let mut dl = self.downloads.remove(idx);
@@ -1669,7 +1849,7 @@ impl WorkerEngine {
     ) {
         let matched = self.downloads.iter_mut().find(|dl| {
             dl.transfer_token == Some(transfer_token)
-                && !dl.in_flight_socket
+                && dl.in_flight_socket.is_none()
                 && username.as_ref().is_none_or(|u| u == &dl.username)
         });
 
@@ -1689,7 +1869,9 @@ impl WorkerEngine {
             return;
         };
 
-        dl.in_flight_socket = true;
+        if let Ok(ctrl_handle) = stream.try_clone() {
+            dl.in_flight_socket = Some(Arc::new(Mutex::new(ctrl_handle)));
+        }
         let download_id = dl.id;
         let final_path = dl.final_path.clone();
         let cancel = Arc::clone(&dl.cancel);
@@ -1764,7 +1946,9 @@ impl WorkerEngine {
         }
         let mut i = 0;
         while i < self.downloads.len() {
-            if self.downloads[i].username == username && !self.downloads[i].in_flight_socket {
+            if self.downloads[i].username == username
+                && self.downloads[i].in_flight_socket.is_none()
+            {
                 let mut dl = self.downloads.remove(i);
                 if let Some(reply) = dl.reply.take() {
                     let _ = reply.send(Err(ClientError::Disconnected(reason.to_owned())));
@@ -1775,15 +1959,66 @@ impl WorkerEngine {
         }
     }
 
+    fn redispatch_after_reconnect(&mut self) {
+        let now = Instant::now();
+        let active_searches: Vec<(u32, String)> = self
+            .searches
+            .iter()
+            .filter(|(_, s)| now < s.deadline)
+            .map(|(&tok, s)| (tok, s.query.clone()))
+            .collect();
+
+        let mut reissued_searches = 0usize;
+        for (token, query) in active_searches {
+            if self
+                .send_server(&ServerRequest::FileSearch { token, query })
+                .is_ok()
+            {
+                reissued_searches += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut watched = HashSet::new();
+        let waiting: Vec<(String, String)> = self
+            .downloads
+            .iter()
+            .filter(|d| d.in_flight_socket.is_none())
+            .map(|d| (d.username.clone(), d.remote_filename.clone()))
+            .collect();
+        for (u, f) in waiting {
+            if watched.insert(u.clone()) {
+                let _ = self.send_server(&ServerRequest::WatchUser {
+                    username: u.clone(),
+                });
+            }
+            let _ = self.ensure_peer_control(
+                &u,
+                PeerMessage::QueueUpload {
+                    filename: f.clone(),
+                },
+            );
+            let _ = self.ensure_peer_control(&u, PeerMessage::PlaceInQueueRequest { filename: f });
+        }
+        self.log(
+            LogLevel::Info,
+            "reconnected",
+            format!("reconnected to server; re-issued {reissued_searches} pending search(es)"),
+        );
+    }
+
     fn tick_timers(&mut self) {
         let now = Instant::now();
 
-        // 1. Server keepalive ping
+        // 1. Server keepalive ping + privilege check (elicits server response for read liveness)
         if self.server_stream.is_some()
-            && now.duration_since(self.last_ping) >= SERVER_PING_INTERVAL
+            && now.duration_since(self.last_ping) >= self.options.ping_interval
         {
             self.last_ping = now;
-            let _ = self.send_server(&ServerRequest::ServerPing);
+            if self.send_server(&ServerRequest::ServerPing).is_ok() {
+                let _ = self.send_server(&ServerRequest::CheckPrivileges);
+            }
         }
 
         // 2. Automatic reconnect when session dropped unexpectedly (not Relogged)
@@ -1797,16 +2032,7 @@ impl WorkerEngine {
             if self.connect_and_authenticate(&creds).is_err() {
                 self.schedule_reconnect();
             } else {
-                // Re-queue any waiting downloads that were not yet actively streaming.
-                let waiting: Vec<(String, String)> = self
-                    .downloads
-                    .iter()
-                    .filter(|d| !d.in_flight_socket)
-                    .map(|d| (d.username.clone(), d.remote_filename.clone()))
-                    .collect();
-                for (u, f) in waiting {
-                    let _ = self.ensure_peer_control(&u, PeerMessage::QueueUpload { filename: f });
-                }
+                self.redispatch_after_reconnect();
             }
         }
 
@@ -1848,7 +2074,7 @@ impl WorkerEngine {
         let mut to_poll = Vec::new();
         let mut i = 0;
         while i < self.downloads.len() {
-            if !self.downloads[i].in_flight_socket
+            if self.downloads[i].in_flight_socket.is_none()
                 && self.downloads[i].cancel.load(Ordering::Acquire)
             {
                 let mut dl = self.downloads.remove(i);
@@ -1859,7 +2085,7 @@ impl WorkerEngine {
                 }
                 continue;
             }
-            if !self.downloads[i].in_flight_socket
+            if self.downloads[i].in_flight_socket.is_none()
                 && now.duration_since(self.downloads[i].last_queue_poll)
                     >= PLACE_IN_QUEUE_POLL_INTERVAL
             {
@@ -1885,8 +2111,15 @@ fn paths_match(a: &str, b: &str) -> bool {
         .eq_ignore_ascii_case(&b.replace('/', "\\"))
 }
 
-fn tx_cant_connect(tx: &Sender<WorkerEvent>, username: String, token: u32, reason: &str) {
+fn tx_cant_connect(
+    tx: &Sender<WorkerEvent>,
+    session_epoch: u64,
+    username: String,
+    token: u32,
+    reason: &str,
+) {
     let _ = tx.send(WorkerEvent::PeerDialFailed {
+        session_epoch,
         username,
         connect_token: Some(token),
         reason: reason.to_owned(),

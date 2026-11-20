@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use peartube_soulseek::client::{ClientError, LogEvent, SoulseekClient};
+use peartube_soulseek::client::{ClientError, ClientOptions, LogEvent, SoulseekClient};
 use peartube_soulseek::proto::{
     AudioAttributes, ConnectionType, PeerInitMessage, PeerMessage, SharedFolder, WireFileEntry,
     WireReader, WireWriter, decode_file_offset, encode_file_transfer_init, read_frame_sync,
@@ -446,6 +446,384 @@ fn end_to_end_login_search_browse_and_resumed_download_over_loopback() {
 
     client.close();
     peer_thread.join().unwrap();
+    srv_thread.join().unwrap();
+    let _ = fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn server_kill_mid_search_reconnects_and_returns_hits() {
+    let srv_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+
+    let srv_thread = thread::spawn(move || {
+        // Session 1: accept login, receive initial FileSearch, then immediately kill socket!
+        let (mut sock1, _) = srv_listener.accept().unwrap();
+        sock1
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let first_search_token = loop {
+            let frame = read_frame_sync(&mut sock1).unwrap();
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    sock1
+                        .write_all(&server_login_ok_frame(
+                            "Session 1",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::CHECK_PRIVILEGES => {
+                    sock1.write_all(&server_check_privs_frame(0)).unwrap();
+                }
+                server_code::FILE_SEARCH => {
+                    let tok = r.read_u32().unwrap();
+                    let query = r.read_string().unwrap();
+                    assert_eq!(query, "aphex twin xtal");
+                    break tok;
+                }
+                _ => {}
+            }
+        };
+        // Drop server socket mid-search without delivering any peer results!
+        drop(sock1);
+
+        // Session 2: accept automatic reconnect, verify SetWaitPort + re-issued FileSearch(same token)
+        let (mut sock2, _) = srv_listener.accept().unwrap();
+        sock2
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut client_listen_port: u16 = 0;
+        while let Ok(frame) = read_frame_sync(&mut sock2) {
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    sock2
+                        .write_all(&server_login_ok_frame(
+                            "Session 2",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::SET_WAIT_PORT => {
+                    client_listen_port = r.read_u32().unwrap() as u16;
+                }
+                server_code::CHECK_PRIVILEGES => {
+                    sock2.write_all(&server_check_privs_frame(120)).unwrap();
+                }
+                server_code::FILE_SEARCH => {
+                    let reissued_token = r.read_u32().unwrap();
+                    let query = r.read_string().unwrap();
+                    assert_eq!(
+                        reissued_token, first_search_token,
+                        "re-dispatched search must preserve original token"
+                    );
+                    assert_eq!(query, "aphex twin xtal");
+                    assert!(
+                        client_listen_port > 0,
+                        "SetWaitPort must be re-sent before search"
+                    );
+
+                    let mut p_sock =
+                        TcpStream::connect((Ipv4Addr::LOCALHOST, client_listen_port)).unwrap();
+                    let init = PeerInitMessage::PeerInit {
+                        username: "ambient_peer".to_string(),
+                        conn_type: ConnectionType::Peer,
+                        token: 0,
+                    }
+                    .encode();
+                    p_sock.write_all(&init).unwrap();
+
+                    let resp = PeerMessage::FileSearchResponse {
+                        username: "ambient_peer".to_string(),
+                        token: reissued_token,
+                        files: vec![WireFileEntry {
+                            filename: "@@music\\SAW 85-92\\01 - Xtal.flac".to_string(),
+                            size: 31_000_000,
+                            extension: String::new(),
+                            attrs: AudioAttributes {
+                                bitrate: None,
+                                length_secs: Some(294),
+                                vbr: None,
+                                sample_rate: Some(44_100),
+                                bit_depth: Some(16),
+                            },
+                        }],
+                        slot_free: true,
+                        upload_speed: 1_800_000,
+                        queue_length: 0,
+                        private_files: Vec::new(),
+                    }
+                    .encode()
+                    .unwrap();
+                    p_sock.write_all(&resp).unwrap();
+                    p_sock.flush().unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let logs: Arc<Mutex<Vec<LogEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let logs_hook = Arc::clone(&logs);
+
+    let client = SoulseekClient::with_options(ClientOptions {
+        listen_port: 0,
+        ping_interval: Duration::from_secs(30),
+        server_read_timeout: Duration::from_secs(30),
+        reconnect_backoff_min: Duration::from_millis(80),
+        reconnect_backoff_max: Duration::from_millis(250),
+    });
+    client.set_logger(Some(Arc::new(move |ev| {
+        logs_hook.lock().push(ev);
+    })));
+
+    client
+        .login("127.0.0.1", srv_port, "reconnect_user", "secret")
+        .unwrap();
+
+    let hits = client.search("aphex twin xtal", 900).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].username, "ambient_peer");
+    assert!(hits[0].filename.ends_with("01 - Xtal.flac"));
+
+    client.close();
+    srv_thread.join().unwrap();
+
+    let captured = logs.lock();
+    assert!(
+        captured
+            .iter()
+            .any(|e| e.event == "reconnected" && e.message.contains("re-issued 1 pending search")),
+        "expected `reconnected` log carrying re-issued search count, got: {captured:?}"
+    );
+}
+
+#[test]
+fn dead_server_socket_detected_by_read_timeout_without_writes() {
+    let srv_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+
+    let srv_thread = thread::spawn(move || {
+        // Session 1: accept login, send LoginSuccess, then hold the socket open in silence
+        // (simulating a half-open / NAT-dropped TCP connection with neither FIN nor RST).
+        let (mut stalled_sock, _) = srv_listener.accept().unwrap();
+        stalled_sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        loop {
+            let frame = read_frame_sync(&mut stalled_sock).unwrap();
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    stalled_sock
+                        .write_all(&server_login_ok_frame(
+                            "Silent session",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::CHECK_PRIVILEGES => {
+                    // Do NOT answer CheckPrivileges — stay completely silent after login!
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // Keep `stalled_sock` alive until Session 2 connects, proving detection needed neither
+        // EOF nor a client write (`ping_interval` is 60s, far beyond the test duration).
+        let (mut sock2, _) = srv_listener.accept().unwrap();
+        drop(stalled_sock);
+        sock2
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        while let Ok(frame) = read_frame_sync(&mut sock2) {
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    sock2
+                        .write_all(&server_login_ok_frame(
+                            "Recovered session",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::CHECK_PRIVILEGES => {
+                    sock2.write_all(&server_check_privs_frame(3600)).unwrap();
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let logs: Arc<Mutex<Vec<LogEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let logs_hook = Arc::clone(&logs);
+
+    // Set ping_interval huge (60s) so zero keepalive writes occur; read timeout alone (200ms) must fire.
+    let client = SoulseekClient::with_options(ClientOptions {
+        listen_port: 0,
+        ping_interval: Duration::from_secs(60),
+        server_read_timeout: Duration::from_millis(200),
+        reconnect_backoff_min: Duration::from_millis(80),
+        reconnect_backoff_max: Duration::from_millis(200),
+    });
+    client.set_logger(Some(Arc::new(move |ev| {
+        logs_hook.lock().push(ev);
+    })));
+
+    client
+        .login("127.0.0.1", srv_port, "timeout_user", "secret")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_read_timeout = false;
+    let mut saw_reconnected = false;
+    while std::time::Instant::now() < deadline {
+        {
+            let captured = logs.lock();
+            saw_read_timeout = captured.iter().any(|e| e.event == "server_read_timeout");
+            saw_reconnected = captured.iter().any(|e| e.event == "reconnected");
+        }
+        if saw_read_timeout && saw_reconnected && client.state().privileges == 3600 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+
+    assert!(saw_read_timeout, "expected `server_read_timeout` event");
+    assert!(saw_reconnected, "expected automatic `reconnected` recovery");
+    assert!(
+        !logs.lock().iter().any(|e| e.event == "server_write_error"),
+        "dead socket must be detected by read timeout without needing a write failure"
+    );
+
+    client.close();
+    srv_thread.join().unwrap();
+}
+
+#[test]
+fn disconnect_fails_inflight_peer_download_and_refreshes_watch_user_on_reconnect() {
+    let srv_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+
+    let watched_on_reconnect: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let watched_srv = Arc::clone(&watched_on_reconnect);
+
+    let srv_thread = thread::spawn(move || {
+        // Session 1: accept login, wait for download's ConnectToPeer + GetPeerAddress, then drop!
+        let (mut sock1, _) = srv_listener.accept().unwrap();
+        sock1
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut dropped_connect_token: Option<u32> = None;
+        while let Ok(frame) = read_frame_sync(&mut sock1) {
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    sock1
+                        .write_all(&server_login_ok_frame(
+                            "Drop test",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::CONNECT_TO_PEER => {
+                    dropped_connect_token = Some(r.read_u32().unwrap());
+                    let _user = r.read_string().unwrap();
+                }
+                server_code::GET_PEER_ADDRESS => {
+                    let _user = r.read_string().unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(dropped_connect_token.is_some());
+        drop(sock1);
+
+        // Session 2: accept reconnect, record WatchUser refreshed for download queued while reconnecting,
+        // then answer CantConnectToPeer so the second download terminates cleanly.
+        let (mut sock2, _) = srv_listener.accept().unwrap();
+        sock2
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        while let Ok(frame) = read_frame_sync(&mut sock2) {
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    sock2
+                        .write_all(&server_login_ok_frame(
+                            "Session 2",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::WATCH_USER => {
+                    let u = r.read_string().unwrap();
+                    watched_srv.lock().push(u);
+                }
+                server_code::CONNECT_TO_PEER => {
+                    let tok = r.read_u32().unwrap();
+                    let _u = r.read_string().unwrap();
+                    let mut w = WireWriter::new();
+                    w.write_u32(tok);
+                    sock2
+                        .write_all(&w.into_u32_frame(server_code::CANT_CONNECT_TO_PEER))
+                        .unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let client = Arc::new(SoulseekClient::with_options(ClientOptions {
+        listen_port: 0,
+        ping_interval: Duration::from_secs(30),
+        server_read_timeout: Duration::from_secs(30),
+        reconnect_backoff_min: Duration::from_millis(250),
+        reconnect_backoff_max: Duration::from_millis(500),
+    }));
+
+    client
+        .login("127.0.0.1", srv_port, "drop_user", "secret")
+        .unwrap();
+
+    let out_dir = temp_dir("drop-dl");
+    let dest = out_dir.join("track.flac");
+    let start = std::time::Instant::now();
+    let res = client.download("unreachable_peer", "@@music\\track.flac", &dest, None);
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(res, Err(ClientError::Disconnected(_))),
+        "expected retryable ClientError::Disconnected on dropped session, got {res:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "pending download must fail promptly on disconnect instead of hanging ({elapsed:?})"
+    );
+
+    // Queue a retry download during the reconnect backoff window and verify WatchUser refreshes on reconnect
+    let dest2 = out_dir.join("retry.flac");
+    let res2 = client.download("watched_peer", "@@music\\retry.flac", &dest2, None);
+    assert!(matches!(res2, Err(ClientError::Disconnected(_))));
+    assert!(
+        watched_on_reconnect
+            .lock()
+            .iter()
+            .any(|u| u == "watched_peer"),
+        "expected WatchUser refresh on reconnect for pending download target"
+    );
+
+    client.close();
     srv_thread.join().unwrap();
     let _ = fs::remove_dir_all(&out_dir);
 }

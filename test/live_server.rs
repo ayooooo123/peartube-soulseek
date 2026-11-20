@@ -3,7 +3,10 @@
 //! Run manually only with a real pre-existing Soulseek account:
 //! `SOULSEEK_USER=... SOULSEEK_PASS=... cargo test --test live_server -- --ignored`
 
-use peartube_soulseek::client::SoulseekClient;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use peartube_soulseek::client::{LogEvent, SoulseekClient};
 
 #[test]
 #[ignore = "hits live Soulseek server; requires SOULSEEK_USER and SOULSEEK_PASS env vars"]
@@ -26,8 +29,20 @@ fn live_login_and_search_smoke() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2271);
+    let search_ms: u64 = std::env::var("SOULSEEK_SEARCH_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+
+    let logs: Arc<Mutex<Vec<LogEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let logs_hook = Arc::clone(&logs);
 
     let client = SoulseekClient::new();
+    client.set_logger(Some(Arc::new(move |ev| {
+        eprintln!("[slsk:{}] {}: {}", ev.level.as_str(), ev.event, ev.message);
+        logs_hook.lock().push(ev);
+    })));
+
     let st = client
         .login(&server, port, &user, &pass)
         .expect("live Soulseek login failed");
@@ -35,9 +50,27 @@ fn live_login_and_search_smoke() {
     assert!(st.logged_in);
 
     let results = client
-        .search("flac", 4_000)
+        .search("boards of canada flac", search_ms)
         .expect("live Soulseek search failed");
-    eprintln!("live search returned {} file records", results.len());
+    eprintln!(
+        "live search ({search_ms}ms) returned {} file records",
+        results.len()
+    );
+    assert!(
+        !results.is_empty(),
+        "expected live search over {search_ms}ms to return hits"
+    );
+
+    let reconnect_count = logs
+        .lock()
+        .iter()
+        .filter(|e| e.event == "reconnected")
+        .count();
+    eprintln!("reconnected events observed: {reconnect_count}");
+    assert!(
+        reconnect_count <= 1,
+        "expected `reconnected` at most once across ping interval, got {reconnect_count}"
+    );
 
     client.close();
 }

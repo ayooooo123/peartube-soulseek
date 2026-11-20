@@ -5,7 +5,9 @@ pub mod ffi;
 pub mod proto;
 pub mod transfer;
 
-pub use client::{ClientError, ClientState, LogEvent, LogLevel, LoggerHook, SoulseekClient};
+pub use client::{
+    ClientError, ClientOptions, ClientState, LogEvent, LogLevel, LoggerHook, SoulseekClient,
+};
 pub use proto::{
     AudioAttributes, ConnectionType, DEFAULT_MAJOR_VERSION, DEFAULT_MINOR_VERSION,
     DistributedMessage, FrameDecoder, LoginRejectReason, PeerInitMessage, PeerMessage, ProtoError,
