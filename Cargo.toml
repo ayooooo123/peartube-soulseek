@@ -1,0 +1,29 @@
+[package]
+name = "peartube-soulseek"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Standalone Soulseek client library with C FFI for the PearTube Bare addon"
+
+[lib]
+name = "peartube_soulseek"
+crate-type = ["rlib", "staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+md-5 = "=0.10.6"
+flate2 = { version = "=1.1.2", default-features = false, features = ["rust_backend"] }
+parking_lot = "=0.12.5"
+
+[[test]]
+name = "proto_codec"
+path = "test/proto_codec.rs"
+
+[[test]]
+name = "client_e2e"
+path = "test/client_e2e.rs"
+
+[[test]]
+name = "live_server"
+path = "test/live_server.rs"
