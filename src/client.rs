@@ -26,7 +26,7 @@ use crate::proto::{
 use crate::transfer::{
     DownloadOutcome, ProgressCallback, TransferError, TransferPhase, TransferProgress,
     UploadOutcome, dial_direct_upload_socket, dial_pierced_file_socket, init_pierced_upload_socket,
-    redacted_basename, resolve_dest_file, stream_file_download, stream_file_upload,
+    redacted_basename, resolve_dest_file, stream_file_download_with_options, stream_file_upload,
 };
 use parking_lot::{Mutex, RwLock};
 
@@ -212,6 +212,7 @@ struct ActiveDownload {
     in_flight_socket: Option<Arc<Mutex<TcpStream>>>,
     last_queue_poll: Instant,
     cancel: Arc<AtomicBool>,
+    preserve_part_on_cancel: bool,
     progress: Option<ProgressCallback>,
     reply: Option<Sender<Result<DownloadOutcome, ClientError>>>,
 }
@@ -344,6 +345,7 @@ enum WorkerCmd {
         dest_path: PathBuf,
         size_hint: Option<u64>,
         cancel: Arc<AtomicBool>,
+        preserve_part_on_cancel: bool,
         progress: Option<ProgressCallback>,
         reply: Sender<Result<DownloadOutcome, ClientError>>,
     },
@@ -672,6 +674,38 @@ impl SoulseekClient {
         cancel: Arc<AtomicBool>,
         progress: Option<ProgressCallback>,
     ) -> Result<DownloadOutcome, ClientError> {
+        self.download_inner(
+            username, filename, dest_path, size_hint, cancel, false, progress,
+        )
+    }
+
+    /// Like [`Self::download_with_cancel`], keeping the `.part` file on disk when aborted via
+    /// `cancel` so a subsequent retry or app restart can resume from the last written byte.
+    pub fn download_resumable(
+        &self,
+        username: &str,
+        filename: &str,
+        dest_path: PathBuf,
+        size_hint: Option<u64>,
+        cancel: Arc<AtomicBool>,
+        progress: Option<ProgressCallback>,
+    ) -> Result<DownloadOutcome, ClientError> {
+        self.download_inner(
+            username, filename, dest_path, size_hint, cancel, true, progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn download_inner(
+        &self,
+        username: &str,
+        filename: &str,
+        dest_path: PathBuf,
+        size_hint: Option<u64>,
+        cancel: Arc<AtomicBool>,
+        preserve_part_on_cancel: bool,
+        progress: Option<ProgressCallback>,
+    ) -> Result<DownloadOutcome, ClientError> {
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
             .send(WorkerCmd::Download {
@@ -680,6 +714,7 @@ impl SoulseekClient {
                 dest_path,
                 size_hint,
                 cancel,
+                preserve_part_on_cancel,
                 progress,
                 reply: tx,
             })
@@ -1876,6 +1911,7 @@ impl WorkerEngine {
                 dest_path,
                 size_hint,
                 cancel,
+                preserve_part_on_cancel,
                 progress,
                 reply,
             } => {
@@ -1943,6 +1979,7 @@ impl WorkerEngine {
                     in_flight_socket: None,
                     last_queue_poll: Instant::now(),
                     cancel,
+                    preserve_part_on_cancel,
                     progress,
                     reply: Some(reply),
                 });
@@ -2321,18 +2358,20 @@ impl WorkerEngine {
         let download_id = dl.id;
         let final_path = dl.final_path.clone();
         let cancel = Arc::clone(&dl.cancel);
+        let preserve_part = dl.preserve_part_on_cancel;
         let progress = dl.progress.clone();
         let tx = self.event_tx.clone();
 
         let _ = thread::Builder::new()
             .name("slsk-file-rx".to_string())
             .spawn(move || {
-                let result = stream_file_download(
+                let result = stream_file_download_with_options(
                     stream,
                     &buffered,
                     final_path,
                     expected_size,
                     &cancel,
+                    preserve_part,
                     progress.as_ref(),
                 );
                 let _ = tx.send(WorkerEvent::TransferFinished {

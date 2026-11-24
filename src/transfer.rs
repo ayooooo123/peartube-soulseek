@@ -219,6 +219,10 @@ impl PartWriter {
         self.written >= self.expected
     }
 
+    pub fn flush(&mut self) -> Result<(), TransferError> {
+        self.file.flush().map_err(TransferError::WriteFailed)
+    }
+
     pub fn discard(self) {
         drop(self.file);
         let _ = fs::remove_file(&self.part_path);
@@ -294,11 +298,33 @@ pub fn dial_pierced_file_socket(
 /// 2. Uploader streams raw file bytes `[offset..expected_size]`.
 /// 3. Downloader closes the `F` socket once `expected_size` bytes are on disk.
 pub fn stream_file_download(
+    stream: TcpStream,
+    initial_buffered: &[u8],
+    final_path: PathBuf,
+    expected_size: u64,
+    cancel: &AtomicBool,
+    on_progress: Option<&ProgressCallback>,
+) -> Result<DownloadOutcome, TransferError> {
+    stream_file_download_with_options(
+        stream,
+        initial_buffered,
+        final_path,
+        expected_size,
+        cancel,
+        false,
+        on_progress,
+    )
+}
+
+/// Like [`stream_file_download`], with `preserve_part_on_cancel` controlling whether an abort via
+/// `cancel` keeps the `.part` file on disk so a subsequent attempt can resume from the last byte.
+pub fn stream_file_download_with_options(
     mut stream: TcpStream,
     initial_buffered: &[u8],
     final_path: PathBuf,
     expected_size: u64,
     cancel: &AtomicBool,
+    preserve_part_on_cancel: bool,
     on_progress: Option<&ProgressCallback>,
 ) -> Result<DownloadOutcome, TransferError> {
     let mut part = PartWriter::open(final_path, expected_size)?;
@@ -337,7 +363,11 @@ pub fn stream_file_download(
 
     while !part.is_complete() {
         if cancel.load(Ordering::Acquire) {
-            part.discard();
+            if preserve_part_on_cancel {
+                let _ = part.flush();
+            } else {
+                part.discard();
+            }
             return Err(TransferError::Cancelled);
         }
 
@@ -377,16 +407,23 @@ pub fn stream_file_download(
                 ) =>
             {
                 if last_activity.elapsed() >= STALL_TIMEOUT {
+                    let _ = part.flush();
                     return Err(TransferError::Stalled);
                 }
             }
-            Err(e) => return Err(TransferError::ReadFailed(e)),
+            Err(e) => {
+                let _ = part.flush();
+                return Err(TransferError::ReadFailed(e));
+            }
         }
     }
 
     // Downloader closes the F socket immediately once expected bytes have arrived.
     drop(stream);
 
+    if !part.is_complete() {
+        let _ = part.flush();
+    }
     let outcome = part.finalize()?;
     if let Some(cb) = on_progress {
         cb(TransferProgress {
@@ -638,4 +675,105 @@ pub fn stream_file_upload(
         bytes_sent: sent,
         speed_bytes_per_sec: avg_speed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn preserve_part_on_cancel_keeps_partial_and_resumes_from_offset() {
+        let dir =
+            std::env::temp_dir().join(format!("pt-slsk-preserve-part-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let final_path = dir.join("track.flac");
+        let part_path = part_path_for(&final_path);
+
+        let payload: Vec<u8> = (0..524_288u32).map(|i| (i % 251) as u8).collect();
+        let total = payload.len() as u64;
+        let half = 262_144usize;
+
+        // First attempt: uploader sends first half, then pauses until cancelled.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let first_half = payload[..half].to_vec();
+        let server1 = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut off = [0u8; 8];
+            sock.read_exact(&mut off).expect("read offset");
+            assert_eq!(u64::from_le_bytes(off), 0);
+            sock.write_all(&first_half).expect("write first half");
+            sock.flush().expect("flush");
+            thread::sleep(Duration::from_secs(2));
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_trigger = Arc::clone(&cancel);
+        let client1 = TcpStream::connect(addr).expect("connect");
+        let progress: ProgressCallback = Arc::new(move |p: TransferProgress| {
+            if p.bytes_downloaded >= 131_072 {
+                cancel_trigger.store(true, Ordering::Release);
+            }
+        });
+        let err = stream_file_download_with_options(
+            client1,
+            &[],
+            final_path.clone(),
+            total,
+            &cancel,
+            true,
+            Some(&progress),
+        )
+        .expect_err("first attempt should abort on cancel");
+        assert!(matches!(err, TransferError::Cancelled), "got {err:?}");
+        let _ = server1.join();
+
+        assert!(
+            part_path.exists(),
+            ".part file must remain when preserve_part_on_cancel is true"
+        );
+        let resumed_offset = fs::metadata(&part_path).expect("part meta").len();
+        assert!(
+            resumed_offset >= 131_072 && resumed_offset <= half as u64,
+            "unexpected partial length {resumed_offset}"
+        );
+
+        // Second attempt: uploader receives `resumed_offset` and sends the remainder.
+        let listener2 = TcpListener::bind("127.0.0.1:0").expect("bind listener 2");
+        let addr2 = listener2.local_addr().expect("listener2 addr");
+        let remainder = payload[resumed_offset as usize..].to_vec();
+        let server2 = thread::spawn(move || {
+            let (mut sock, _) = listener2.accept().expect("accept 2");
+            let mut off = [0u8; 8];
+            sock.read_exact(&mut off).expect("read resume offset");
+            assert_eq!(u64::from_le_bytes(off), resumed_offset);
+            sock.write_all(&remainder).expect("write remainder");
+            sock.flush().expect("flush 2");
+        });
+
+        let client2 = TcpStream::connect(addr2).expect("connect 2");
+        let outcome = stream_file_download_with_options(
+            client2,
+            &[],
+            final_path.clone(),
+            total,
+            &AtomicBool::new(false),
+            true,
+            None,
+        )
+        .expect("second attempt should resume and complete");
+        server2.join().expect("server2");
+
+        assert_eq!(outcome.resumed_from, resumed_offset);
+        assert_eq!(outcome.size, total);
+        assert!(
+            !part_path.exists(),
+            ".part file must be renamed on completion"
+        );
+        assert_eq!(fs::read(&final_path).expect("read final"), payload);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
