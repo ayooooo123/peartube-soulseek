@@ -19,5 +19,5 @@ pub use proto::{
 };
 pub use transfer::{
     DownloadOutcome, PartWriter, ProgressCallback, TransferError, TransferPhase, TransferProgress,
-    UploadOutcome,
+    UploadOutcome, stream_file_download_with_options,
 };
