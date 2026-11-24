@@ -1560,3 +1560,171 @@ fn sharing_defaults_off_advertising_zero_counts_and_zero_slots_until_explicitly_
     assert_eq!(reported_shares.lock().as_slice(), &[(0, 0), (1, 1)]);
     let _ = fs::remove_dir_all(&share_dir);
 }
+
+#[test]
+fn server_disconnect_preserves_active_file_transfer() {
+    let srv_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let srv_port = srv_listener.local_addr().unwrap().port();
+    let peer_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer_port = peer_listener.local_addr().unwrap().port();
+
+    let payload: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    let payload_for_peer = payload.clone();
+
+    let (transfer_started_tx, transfer_started_rx) = std::sync::mpsc::channel::<()>();
+    let (server_dropped_tx, server_dropped_rx) = std::sync::mpsc::channel::<()>();
+
+    let srv_thread = thread::spawn(move || {
+        // Session 1: log in, provide peer address, then drop the server socket once the F transfer is active!
+        let (mut sock1, _) = srv_listener.accept().unwrap();
+        sock1
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        while let Ok(frame) = read_frame_sync(&mut sock1) {
+            let mut r = WireReader::new(&frame);
+            match r.read_u32().unwrap() {
+                server_code::LOGIN => {
+                    sock1
+                        .write_all(&server_login_ok_frame(
+                            "Session 1",
+                            Ipv4Addr::LOCALHOST,
+                            false,
+                        ))
+                        .unwrap();
+                }
+                server_code::GET_PEER_ADDRESS => {
+                    let user = r.read_string().unwrap();
+                    let mut w = WireWriter::new();
+                    w.write_str(&user);
+                    w.write_ipv4(Ipv4Addr::LOCALHOST);
+                    w.write_u32(u32::from(peer_port));
+                    sock1
+                        .write_all(&w.into_u32_frame(server_code::GET_PEER_ADDRESS))
+                        .unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Wait until the peer F-socket transfer is actively streaming bytes, then drop the server socket.
+        transfer_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("transfer did not start");
+        drop(sock1);
+        let _ = server_dropped_tx.send(());
+
+        // Session 2: accept automatic reconnect in the background.
+        let (mut sock2, _) = srv_listener.accept().unwrap();
+        sock2
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        while let Ok(frame) = read_frame_sync(&mut sock2) {
+            let mut r = WireReader::new(&frame);
+            if r.read_u32().unwrap() == server_code::LOGIN {
+                sock2
+                    .write_all(&server_login_ok_frame(
+                        "Session 2",
+                        Ipv4Addr::LOCALHOST,
+                        false,
+                    ))
+                    .unwrap();
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    });
+
+    let client = Arc::new(SoulseekClient::with_options(ClientOptions {
+        listen_port: 0,
+        ping_interval: Duration::from_secs(30),
+        server_read_timeout: Duration::from_secs(30),
+        reconnect_backoff_min: Duration::from_millis(80),
+        reconnect_backoff_max: Duration::from_millis(250),
+        ..ClientOptions::default()
+    }));
+    let client_port = client.state().listen_port;
+
+    let peer_thread = thread::spawn(move || {
+        let (mut p_sock, _) = peer_listener.accept().unwrap();
+        p_sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let init = PeerInitMessage::decode(&read_frame_sync(&mut p_sock).unwrap()).unwrap();
+        assert!(matches!(init, PeerInitMessage::PeerInit { .. }));
+
+        while let Ok(frame) = read_frame_sync(&mut p_sock) {
+            match PeerMessage::decode(&frame).unwrap() {
+                PeerMessage::QueueUpload { filename } => {
+                    let req = PeerMessage::TransferRequest {
+                        direction: 1,
+                        token: 777_001,
+                        filename,
+                        file_size: Some(payload_for_peer.len() as u64),
+                    }
+                    .encode()
+                    .unwrap();
+                    p_sock.write_all(&req).unwrap();
+                }
+                PeerMessage::TransferResponse {
+                    token: 777_001,
+                    allowed: true,
+                    ..
+                } => {
+                    let mut f_sock =
+                        TcpStream::connect((Ipv4Addr::LOCALHOST, client_port)).unwrap();
+                    let f_init = PeerInitMessage::PeerInit {
+                        username: "active_peer".to_string(),
+                        conn_type: ConnectionType::File,
+                        token: 0,
+                    }
+                    .encode();
+                    f_sock.write_all(&f_init).unwrap();
+                    f_sock
+                        .write_all(&encode_file_transfer_init(777_001))
+                        .unwrap();
+                    f_sock.flush().unwrap();
+
+                    let mut off_bytes = [0u8; 8];
+                    f_sock.read_exact(&mut off_bytes).unwrap();
+                    let offset = decode_file_offset(&off_bytes).unwrap() as usize;
+                    assert_eq!(offset, 0);
+
+                    // Send first half, signal server to disconnect, then wait briefly and send the rest.
+                    let mid = payload_for_peer.len() / 2;
+                    f_sock.write_all(&payload_for_peer[..mid]).unwrap();
+                    f_sock.flush().unwrap();
+                    let _ = transfer_started_tx.send(());
+                    server_dropped_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("server did not drop");
+                    thread::sleep(Duration::from_millis(150));
+                    f_sock.write_all(&payload_for_peer[mid..]).unwrap();
+                    f_sock.flush().unwrap();
+
+                    let mut eof = [0u8; 1];
+                    let _ = f_sock.read(&mut eof);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    client
+        .login("127.0.0.1", srv_port, "transfer_user", "secret")
+        .unwrap();
+
+    let out_dir = temp_dir("keep-active-dl");
+    let dest = out_dir.join("01 - Active.flac");
+    let outcome = client
+        .download("active_peer", "@@music\\01 - Active.flac", &dest, None)
+        .expect("active direct peer file transfer must survive a transient server disconnect");
+
+    assert_eq!(outcome.size, payload.len() as u64);
+    assert_eq!(fs::read(&dest).unwrap(), payload);
+
+    client.close();
+    peer_thread.join().unwrap();
+    srv_thread.join().unwrap();
+    let _ = fs::remove_dir_all(&out_dir);
+}
