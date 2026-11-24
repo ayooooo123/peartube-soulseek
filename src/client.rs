@@ -943,7 +943,9 @@ impl WorkerEngine {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
                     ) => {}
                 Err(_) => return,
             }
@@ -985,7 +987,9 @@ impl WorkerEngine {
                         Err(e)
                             if matches!(
                                 e.kind(),
-                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                io::ErrorKind::WouldBlock
+                                    | io::ErrorKind::TimedOut
+                                    | io::ErrorKind::Interrupted
                             ) => {}
                         Err(_) => return,
                     }
@@ -1243,10 +1247,23 @@ impl WorkerEngine {
                 self.update_state(false, false, None);
                 return Err(ClientError::Timeout("server login".to_string()));
             }
-            let n = stream.read(&mut buf).map_err(|e| {
-                self.update_state(false, false, None);
-                ClientError::Io(format!("read login response: {e}"))
-            })?;
+            let n = match stream.read(&mut buf) {
+                Ok(n) => n,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => {
+                    self.update_state(false, false, None);
+                    return Err(ClientError::Io(format!("read login response: {e}")));
+                }
+            };
             if n == 0 {
                 self.update_state(false, false, None);
                 return Err(ClientError::Disconnected(
@@ -1746,11 +1763,24 @@ impl WorkerEngine {
                     let _ = thread::Builder::new()
                         .name("slsk-pierce-rx-f".to_string())
                         .spawn(move || {
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
                             let mut buf = [0u8; 1024];
                             while decoder.buffered_len() < 4 {
+                                if Instant::now() >= deadline {
+                                    return;
+                                }
                                 match stream.read(&mut buf) {
-                                    Ok(0) | Err(_) => return,
+                                    Ok(0) => return,
                                     Ok(n) => decoder.push(&buf[..n]),
+                                    Err(e)
+                                        if matches!(
+                                            e.kind(),
+                                            io::ErrorKind::Interrupted
+                                                | io::ErrorKind::WouldBlock
+                                                | io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(_) => return,
                                 }
                             }
                             if let Some(tok) = decoder.take_raw(4) {
