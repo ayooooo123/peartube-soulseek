@@ -31,7 +31,7 @@ use crate::transfer::{
 use parking_lot::{Mutex, RwLock};
 
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(45);
-const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1053,11 +1053,11 @@ impl WorkerEngine {
             self.tick_timers();
         }
 
-        self.disconnect_server();
-        self.abort_session_peer_work("client shutting down");
+        self.disconnect_server(false);
+        self.abort_session_peer_work("client shutting down", false);
     }
 
-    fn abort_session_peer_work(&mut self, reason: &str) {
+    fn abort_session_peer_work(&mut self, reason: &str, keep_active_transfers: bool) {
         self.pending_connect_tokens.clear();
         self.pending_peer_msgs.clear();
         for (_, (_, writer)) in self.peers.drain() {
@@ -1068,7 +1068,13 @@ impl WorkerEngine {
                 let _ = reply.send(Err(ClientError::Disconnected(reason.to_owned())));
             }
         }
-        for mut dl in self.downloads.drain(..) {
+        let mut i = 0;
+        while i < self.downloads.len() {
+            if keep_active_transfers && self.downloads[i].in_flight_socket.is_some() {
+                i += 1;
+                continue;
+            }
+            let mut dl = self.downloads.remove(i);
             if let Some(sock) = dl.in_flight_socket.take() {
                 let _ = sock.lock().shutdown(std::net::Shutdown::Both);
             }
@@ -1083,7 +1089,13 @@ impl WorkerEngine {
                     .send(Err(ClientError::Disconnected(reason.to_owned())));
             }
         }
-        for mut up in self.uploads.drain(..) {
+        let mut j = 0;
+        while j < self.uploads.len() {
+            if keep_active_transfers && self.uploads[j].in_flight_socket.is_some() {
+                j += 1;
+                continue;
+            }
+            let mut up = self.uploads.remove(j);
             up.cancel.store(true, Ordering::Release);
             if let Some(sock) = up.in_flight_socket.take() {
                 let _ = sock.lock().shutdown(std::net::Shutdown::Both);
@@ -1091,7 +1103,7 @@ impl WorkerEngine {
         }
     }
 
-    fn disconnect_server(&mut self) {
+    fn disconnect_server(&mut self, keep_active_transfers: bool) {
         let had_session = self.server_stream.is_some();
         if let Some(s) = self.server_stream.take() {
             let _ = s.shutdown(std::net::Shutdown::Both);
@@ -1100,7 +1112,7 @@ impl WorkerEngine {
         self.update_state(false, false, None);
         if had_session {
             self.session_epoch = self.session_epoch.wrapping_add(1);
-            self.abort_session_peer_work("server session disconnected");
+            self.abort_session_peer_work("server session disconnected", keep_active_transfers);
         }
     }
 
@@ -1122,7 +1134,7 @@ impl WorkerEngine {
     }
 
     fn schedule_reconnect(&mut self) {
-        self.disconnect_server();
+        self.disconnect_server(true);
         if self.creds.is_some() && !self.relogged_out {
             self.reconnect_at = Some(Instant::now() + self.reconnect_backoff);
             self.reconnect_backoff =
@@ -1134,7 +1146,7 @@ impl WorkerEngine {
         &mut self,
         creds: &Credentials,
     ) -> Result<ClientState, ClientError> {
-        self.disconnect_server();
+        self.disconnect_server(false);
 
         let addr: SocketAddr = format!("{}:{}", creds.server_host, creds.server_port)
             .to_socket_addrs()
@@ -1354,7 +1366,7 @@ impl WorkerEngine {
                     "relogged",
                     "another client logged in with this account; stopping auto-reconnect",
                 );
-                self.disconnect_server();
+                self.disconnect_server(false);
             }
             ServerResponse::PeerAddress {
                 username, ip, port, ..
