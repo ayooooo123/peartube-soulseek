@@ -1,6 +1,7 @@
 //! Standalone Soulseek client library in Rust with a non-blocking C ABI (`soulseek/soulseek.h`).
 
 pub mod client;
+#[cfg(feature = "c-api")]
 pub mod ffi;
 pub mod proto;
 pub mod transfer;

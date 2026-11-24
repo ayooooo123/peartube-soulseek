@@ -7,6 +7,10 @@ license = "MIT"
 description = "Standalone Soulseek client library in Rust with C ABI"
 links = "peartube_soulseek"
 
+[features]
+default = ["c-api"]
+c-api = []
+
 [lib]
 name = "peartube_soulseek"
 crate-type = ["rlib", "staticlib"]
